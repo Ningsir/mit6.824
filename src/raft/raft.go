@@ -45,6 +45,7 @@ type Log struct {
 }
 
 //
+// 当peer意识到有日志被提交了，其需要将日志应用到状态机，也就是将命令发送给service并执行
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -143,7 +144,8 @@ type Raft struct {
 	// 心跳超时计时器
 	heartHeatTimer *Timer
 	// 服务器的状态：leader, fllower, candidate
-	state State
+	state   State
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -272,11 +274,9 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) ModifyCurrentTerm(term int) bool {
 	if rf.CurrentTerm < term {
-		// rf.mu.Lock()
 		rf.CurrentTerm = term
 		rf.VotedFor = -1
 		rf.state = Follower
-		// rf.mu.Unlock()
 		return true
 	}
 	return false
@@ -317,7 +317,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 	}
-
 	// DPrintf("request vote finished: %d --> %d", args.CandidateId, rf.me)
 }
 
@@ -398,12 +397,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 //
+// 如果server不是leader，返回false。不能保证命令一定会提交到Raft日志中
+//
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
 
 	// Your code here (2B).
+
+	// 调用AppendEntries
+	// 根据matchIndex来修改commitIndex
+	// 返回成功说明已经复制了日志到跟随者，所以立即判断是否需要修改commitIndex
+	// 提交后该日志应用到状态机中
 
 	return index, term, isLeader
 }
@@ -453,11 +459,9 @@ func (rf *Raft) startElection() {
 		if i != rf.me {
 			go func(server int) {
 				reply := &RequestVoteReply{}
-				DPrintf("server: %d", server)
 				//
 				// 收到正常回复
 				if rf.sendRequestVote(server, args, reply) {
-					DPrintf("锁")
 					rf.mu.Lock()
 					// 检查是否为过期的回复
 					if rf.CurrentTerm == args.Term && rf.state == Candidate {
@@ -475,36 +479,25 @@ func (rf *Raft) startElection() {
 							// DPrintf("peer %d get vote from %d", rf.me, server)
 						} else {
 							rf.ModifyCurrentTerm(reply.Term)
-							DPrintf("{peer: %d} (term: %d) refuse voting to %d(term: %d)", server, reply.Term, rf.me, rf.CurrentTerm)
+							// DPrintf("{peer: %d} (term: %d) refuse voting to %d(term: %d)", server, reply.Term, rf.me, rf.CurrentTerm)
 						}
 					} else {
-						DPrintf("{peer: %d} (term: %d) 收到过期的回复", rf.me, rf.CurrentTerm)
+						// DPrintf("{peer: %d} (term: %d) 收到过期的回复", rf.me, rf.CurrentTerm)
 					}
 					rf.mu.Unlock()
 				} else {
-					DPrintf("{peer: %d}(term: %d) cant connect to %d", rf.me, rf.CurrentTerm, server)
+					// DPrintf("{peer: %d}(term: %d) cant connect to %d", rf.me, rf.CurrentTerm, server)
 				}
 			}(i)
 		}
 	}
-
-	// DPrintf("peer: %d, request vote finished, term: %d", rf.me, rf.CurrentTerm)
-	// 选出领导人
-	// rf.mu.Lock()
-	// if rf.numVotes > len(rf.peers)/2 {
-	// 	DPrintf("peer: %d is leader, term: %d", rf.me, rf.CurrentTerm)
-	// 	rf.state = Leader
-	// } else {
-	// 	DPrintf("peer: %d is not a leader, term: %d", rf.me, rf.CurrentTerm)
-	// }
-	// rf.mu.Unlock()
 }
 
 //
 // 发送心跳包
 //
 func (rf *Raft) sendHeartBeat() {
-	DPrintf("leader %d (term: %d) broadcast heart beat", rf.me, rf.CurrentTerm)
+	// DPrintf("leader %d (term: %d) broadcast heart beat", rf.me, rf.CurrentTerm)
 	// 收到正常心跳回复的数量
 	// numHearts := 0
 	rf.heartHeatTimer.reset(StableHeartBeatTimeout())
@@ -542,7 +535,6 @@ func (rf *Raft) sendHeartBeat() {
 			}(i)
 		}
 	}
-	// wg.Wait()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -592,6 +584,7 @@ func (rf *Raft) ticker() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
+// applyCh将命令应用到状态机
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
@@ -599,9 +592,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
 	// Your initialization code here (2A, 2B, 2C).
 	// 初始化计时器和状态
+	rf.applyCh = applyCh
 	rf.CurrentTerm = 0
 	rf.VotedFor = -1
 	rf.electionTimer = &Timer{}
@@ -609,15 +602,46 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimer.reset(RandomElectionTimeout())
 	rf.heartHeatTimer = &Timer{}
 	rf.heartHeatTimer.reset(StableHeartBeatTimeout())
-	DPrintf("peers: %d, random timer: %d ms", rf.me, rf.electionTimer.timeout_)
 	rf.state = Follower
 	log0 := Log{nil, rf.CurrentTerm}
 	rf.LogEntries = append(rf.LogEntries, log0)
-	// 初始化持久性状态
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	// 初始化持久性状态：CurrentTerm, VotedFor, LogEntries
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	// 初始值为领导人最后的日志条目的索引+1
+	rf.nextIndex = make([]int, len(rf.peers))
+	index := len(rf.LogEntries)
+	for i := range rf.peers {
+		rf.nextIndex[i] = index
+	}
+	// 初始值为0
+	rf.matchIndex = make([]int, len(rf.peers))
 	// 开始选票
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.apply()
 	return rf
+}
+
+//
+// 应用到状态机
+//
+func (rf *Raft) apply() {
+	for rf.killed() == false {
+		time.Sleep(time.Millisecond * 10)
+		rf.mu.Lock()
+		if rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.LogEntries[rf.lastApplied],
+				CommandIndex: rf.lastApplied,
+			}
+			rf.applyCh <- msg
+		}
+		rf.mu.Unlock()
+	}
 }
