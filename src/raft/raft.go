@@ -370,6 +370,14 @@ func Min(a int, b int) int {
 	}
 }
 
+func Max(a int, b int) int {
+	if a < b {
+		return b
+	} else {
+		return a
+	}
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -381,7 +389,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.ModifyCurrentTerm(args.Term)
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
-		DPrintf("{Follower %d(term: %d)} mismatch", rf.me, rf.CurrentTerm)
+		DPrintf("{Follower %d(term: %d)} mismatch, args.term: %d, PrevLogIndex: %d, PrevLogTerm: %d, logs: %+v", rf.me, rf.CurrentTerm, args.Term, args.PrevLogIndex, args.PrevLogTerm, rf.LogEntries)
 		return
 	}
 	// 修改任期号
@@ -389,10 +397,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 匹配上且不是心跳
 	if len(args.Entries) != 0 {
-		// 复制日志到follower上
-		// **如果**一个已经存在的条目和新条目（译者注：即刚刚接收到的日志条目）发生
+		// 1. **如果**一个已经存在的条目和新条目（译者注：即刚刚接收到的日志条目）发生
 		// 了冲突（因为索引相同，任期不同），那么就删除这个已经存在的条目以及它之后的所有条目
-		index := Min(len(args.Entries)+args.PrevLogIndex, len(rf.LogEntries))
+		// 2. 追加日志中尚未存在的任何新条目
+		// index := Min(len(args.Entries)+args.PrevLogIndex+1, len(rf.LogEntries))
+		index := -1
 		for i, log := range args.Entries {
 			if i+args.PrevLogIndex+1 < len(rf.LogEntries) &&
 				log.Term != rf.LogEntries[i+args.PrevLogIndex+1].Term {
@@ -405,9 +414,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				break
 			}
 		}
-		rf.LogEntries = append(rf.LogEntries[:index], args.Entries[index-1-args.PrevLogIndex:]...)
-		DPrintf("{Follower %d(term: %d)} append entries{%v}", rf.me, rf.CurrentTerm, args.Entries)
+		// 发生冲突
+		if index != -1 {
+			rf.LogEntries = append(rf.LogEntries[:index], args.Entries[index-1-args.PrevLogIndex:]...)
+		} else if len(args.Entries)+args.PrevLogIndex+1 > len(rf.LogEntries) {
+			//  2. 追加日志中尚未存在的任何新条目
+			firstIndex := len(rf.LogEntries) - args.PrevLogIndex - 1
+			rf.LogEntries = append(rf.LogEntries, args.Entries[firstIndex:]...)
+		}
+		DPrintf("{Follower %d(term: %d)} append entries{%+v} -> {%+v}", rf.me, rf.CurrentTerm, args.Entries, rf.LogEntries)
 	}
+	// 根据参数leaderCommit更新commitIndex
 	if args.LeaderCommit > rf.commitIndex {
 		// 为什么取最小值？
 		rf.commitIndex = Min(args.LeaderCommit, len(rf.LogEntries)-1)
@@ -458,7 +475,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	log := Log{command, rf.CurrentTerm}
 	rf.LogEntries = append(rf.LogEntries, log)
-	// DPrintf("log length: %d", len(rf.LogEntries))
+	// 利用日志的长度更新nextIndex和matchIndex
 	rf.nextIndex[rf.me] = len(rf.LogEntries)
 	rf.matchIndex[rf.me] = len(rf.LogEntries) - 1
 	index, term, isLeader = len(rf.LogEntries)-1, rf.CurrentTerm, true
@@ -476,33 +493,43 @@ func (rf *Raft) sendHeartBeat(heartType HeartType) {
 	if heartType == HeartsBeat {
 		for i := range rf.peers {
 			if i != rf.me {
-				go func(server int) {
-					rf.handleHeartBeat(server)
-				}(i)
+				args := &AppendEntriesArgs{}
+				args.Term = rf.CurrentTerm
+				args.LeaderId = rf.me
+				args.LeaderCommit = rf.commitIndex
+				index := rf.nextIndex[i] - 1
+				args.PrevLogIndex = index
+				args.PrevLogTerm = rf.LogEntries[index].Term
+				go func(server int, appendArgs *AppendEntriesArgs) {
+					rf.handleHeartBeat(server, appendArgs)
+				}(i, args)
 			}
 		}
 	} else if heartType == AppendEntries { // 添加新的日志
 		for i := range rf.peers {
 			if i != rf.me {
-				go func(server int) {
-					rf.handleAppendEntries(server)
-				}(i)
+				// 参数
+				args := &AppendEntriesArgs{}
+				args.Term = rf.CurrentTerm
+				args.LeaderId = rf.me
+				args.LeaderCommit = rf.commitIndex
+				// start和handleAppendEntries应该是一个整体
+				index := rf.nextIndex[i] - 1
+				args.PrevLogIndex = index
+				// 数组越界，index为-1或者
+				args.PrevLogTerm = rf.LogEntries[index].Term
+				args.Entries = append(args.Entries, rf.LogEntries[index+1:]...)
+				DPrintf("{Leader: %d (term: %d)} append entries {index: %d -- %d, %+v} to follower %d, args: {prevLogIndex: %d, preLogTerm: %d, leaderCommit: %d}",
+					rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), args.Entries, i, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+				go func(server int, appendArgs *AppendEntriesArgs) {
+					rf.handleAppendEntries(server, appendArgs)
+				}(i, args)
 			}
 		}
 	}
-
 }
-func (rf *Raft) handleHeartBeat(server int) {
-	rf.mu.Lock()
-	args := &AppendEntriesArgs{}
-	args.Term = rf.CurrentTerm
-	args.LeaderId = rf.me
-	args.LeaderCommit = rf.commitIndex
-	index := rf.nextIndex[server] - 1
-	args.PrevLogIndex = index
-	args.PrevLogTerm = rf.LogEntries[index].Term
+func (rf *Raft) handleHeartBeat(server int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
-	rf.mu.Unlock()
 	// TODO：可否在收不到一半的回复时将leader转换为follower？
 	if rf.sendAppendEntries(server, args, reply) {
 		rf.mu.Lock()
@@ -514,25 +541,9 @@ func (rf *Raft) handleHeartBeat(server int) {
 		rf.mu.Unlock()
 	}
 }
-func (rf *Raft) handleAppendEntries(server int) {
+func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 	for true {
-		rf.mu.Lock()
-		// 参数
-		args := &AppendEntriesArgs{}
-		args.Term = rf.CurrentTerm
-		args.LeaderId = rf.me
-		args.LeaderCommit = rf.commitIndex
-		index := rf.nextIndex[server] - 1
-		args.PrevLogIndex = index
-		args.PrevLogTerm = rf.LogEntries[index].Term
-		// args.Entries = rf.LogEntries[index:]
-		// copy(args.Entries, rf.LogEntries[index+1:])
-		// index + 1越界问题？
-		args.Entries = append(args.Entries, rf.LogEntries[index+1:]...)
 		reply := &AppendEntriesReply{}
-		DPrintf("{Leader: %d (term: %d)} append entries {index: %d -- %d, %v} to follower %d, args: {prevLogIndex: %d, preLogTerm: %d, leaderCommit: %d, logs length: %d}",
-			rf.me, rf.CurrentTerm, index+1, len(rf.LogEntries)-1, args.Entries, server, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
-		rf.mu.Unlock()
 		if rf.sendAppendEntries(server, args, reply) {
 			rf.mu.Lock()
 			// 任期相同
@@ -544,16 +555,34 @@ func (rf *Raft) handleAppendEntries(server int) {
 				}
 				if reply.Success == false {
 					// 修改nextIndex重试
-					rf.nextIndex[server]--
+					// nextIndex可能已经发生变化了
+					// rf.nextIndex[server]--
+					rf.nextIndex[server] = args.PrevLogIndex
+					args.Term = rf.CurrentTerm
+					args.LeaderId = rf.me
+					args.LeaderCommit = rf.commitIndex
+					// start和handleAppendEntries应该是一个整体
+					// nextIndex可能已经发生变化
+					args.PrevLogIndex--
+					// 数组越界，index为-1或者
+					args.PrevLogTerm = rf.LogEntries[args.PrevLogIndex].Term
+					// index + 1越界问题？
+					// Entries清空
+					args.Entries = append(args.Entries[:0], rf.LogEntries[args.PrevLogIndex+1:]...)
+					DPrintf("{Leader: %d (term: %d)} retry appending entries {index: %d -- %d, %+v} to follower %d, args: {prevLogIndex: %d, preLogTerm: %d, leaderCommit: %d}",
+						rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), args.Entries, server, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 					rf.mu.Unlock()
 					continue
 				} else { // 日志条目匹配上
-					rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-					rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+					// 为什么不利用len(rf.LogEntries)来计算nextIndex和matchIndex？
+					// 因为rf.LogEntries可能已经发生变化了
+					// 取最大值避免越改越小
+					rf.nextIndex[server] = Max(args.PrevLogIndex+len(args.Entries)+1, rf.nextIndex[server])
+					rf.matchIndex[server] = Max(args.PrevLogIndex+len(args.Entries), rf.matchIndex[server])
 					// 遍历matchIndex查看是否需要提交
 					rf.commitLog()
-					DPrintf("Finished: {Leader: %d (term: %d)} append entries {index: %d -- %d, %v} to follower %d, matchIndex: %v",
-						rf.me, rf.CurrentTerm, index+1, len(rf.LogEntries)-1, args.Entries, server, rf.matchIndex)
+					DPrintf("Finished: {Leader: %d (term: %d)} append entries {index: %d -- %d, %v} to follower %d, matchIndex: %v, nextIndex: %v",
+						rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), args.Entries, server, rf.matchIndex, rf.nextIndex)
 					rf.mu.Unlock()
 					break
 				}
@@ -579,23 +608,8 @@ func (rf *Raft) commitLog() {
 	N := matchCopy[mid]
 	if rf.LogEntries[N].Term == rf.CurrentTerm {
 		rf.commitIndex = N
-		DPrintf("{Leader: %d (term: %d)} commit log {index: %d, term: %d}, matchCopy: %v", rf.me, rf.CurrentTerm, N, rf.LogEntries[N].Term, matchCopy)
+		DPrintf("{Leader: %d (term: %d)} commit log {index: %d, term: %d}, matchIndex: %v", rf.me, rf.CurrentTerm, N, rf.LogEntries[N].Term, rf.matchIndex)
 	}
-	// mapCount := make(map[int]int)
-	// for _, index := range rf.matchIndex {
-	// 	if _, ok := mapCount[index]; ok {
-	// 		mapCount[index]++
-	// 	} else {
-	// 		mapCount[index] = 1
-	// 	}
-	// }
-	// for index, count := range mapCount {
-	// 	// 复制到大多数服务器并且该日志处于当前任期
-	// 	if count > len(rf.matchIndex)/2 && rf.LogEntries[index].Term == rf.CurrentTerm {
-	// 		rf.commitIndex = index
-	// 		DPrintf("{Leader: %d (term: %d)} commit log {index: %d, term: %d}", rf.me, rf.CurrentTerm, index, rf.LogEntries[index].Term)
-	// 	}
-	// }
 }
 
 //
