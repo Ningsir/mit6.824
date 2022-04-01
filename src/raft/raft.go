@@ -428,17 +428,33 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.electionTimer.reset(RandomElectionTimeout())
-	// leader任期过小或者PrevLogIndex越界或者日志不匹配，直接返回false
-	if args.Term < rf.CurrentTerm ||
-		args.PrevLogIndex >= len(rf.LogEntries) ||
-		rf.LogEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.ModifyCurrentTerm(args.Term)
+	// leader任期过小
+	if args.Term < rf.CurrentTerm {
+		reply.Success, reply.Term = false, rf.CurrentTerm
+		return
+	}
+	rf.ModifyCurrentTerm(args.Term)
+	// PrevLogIndex越界
+	if args.PrevLogIndex >= len(rf.LogEntries) {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
-		if args.PrevLogIndex < len(rf.LogEntries) {
-			DPrintf("{Follower %d(term: %d), PrevLogTerm: %d} mismatch {Leader %d(term:%d), PrevLogIndex: %d, PrevLogTerm: %d}",
-				rf.me, rf.CurrentTerm, rf.LogEntries[args.PrevLogIndex].Term, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
+		reply.ConflictTerm = -1
+		reply.MinIndex = len(rf.LogEntries)
+		return
+	}
+	// 日志不匹配
+	if rf.LogEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.CurrentTerm
+		reply.ConflictTerm = rf.LogEntries[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			if rf.LogEntries[args.PrevLogIndex].Term != rf.LogEntries[i].Term {
+				reply.MinIndex = i + 1
+				break
+			}
 		}
+		DPrintf("{Follower %d(term: %d), ConflictTerm: %d, ConflictIndex: %d} mismatch {Leader %d(term:%d), PrevLogIndex: %d, PrevLogTerm: %d}",
+			rf.me, rf.CurrentTerm, rf.LogEntries[args.PrevLogIndex].Term, reply.MinIndex, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 		return
 	}
 	// 修改任期号
@@ -615,19 +631,19 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 				if reply.Term > rf.CurrentTerm {
 					rf.ModifyCurrentTerm(reply.Term)
 					rf.mu.Unlock()
-					return
+					break
 				}
+				// 日志不匹配
 				if reply.Success == false {
 					// 修改nextIndex重试
 					// nextIndex可能已经发生变化了
-					// rf.nextIndex[server]--
-					rf.nextIndex[server] = args.PrevLogIndex
+					index := rf.searchConflictLogIndex(reply)
+					rf.nextIndex[server] = index
+					args.PrevLogIndex = index - 1
 					args.Term = rf.CurrentTerm
 					args.LeaderId = rf.me
 					args.LeaderCommit = rf.commitIndex
 					// start和handleAppendEntries应该是一个整体
-					// nextIndex可能已经发生变化
-					args.PrevLogIndex--
 					args.PrevLogTerm = rf.LogEntries[args.PrevLogIndex].Term
 					// Entries清空
 					args.Entries = append(args.Entries[:0], rf.LogEntries[args.PrevLogIndex+1:]...)
@@ -655,6 +671,20 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 			continue
 		}
 	}
+}
+
+func (rf *Raft) searchConflictLogIndex(reply *AppendEntriesReply) int {
+	if reply.ConflictTerm == -1 {
+		return reply.MinIndex
+	}
+	conflictIndex := reply.MinIndex
+	for i := len(rf.LogEntries) - 1; i >= 0; i-- {
+		if rf.LogEntries[i].Term == reply.ConflictTerm {
+			conflictIndex = i + 1
+			break
+		}
+	}
+	return conflictIndex
 }
 
 //
