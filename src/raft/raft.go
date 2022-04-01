@@ -26,7 +26,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
 	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -317,6 +316,10 @@ type AppendEntriesReply struct {
 	Term int
 	// 如果跟随者所含有的条目和 prevLogIndex 以及 prevLogTerm 匹配上了，则为 true
 	Success bool
+	// 发生冲突的任期号
+	ConflictTerm int
+	// ConflictTerm对应的日志的最小索引值
+	MinIndex int
 }
 
 //
@@ -433,8 +436,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
 		if args.PrevLogIndex < len(rf.LogEntries) {
-			DPrintf("{Follower %d(term: %d)} mismatch, args.term: %d, PrevLogIndex: %d, PrevLogTerm: %d, logs term: %d",
-				rf.me, rf.CurrentTerm, args.Term, args.PrevLogIndex, args.PrevLogTerm, rf.LogEntries[args.PrevLogIndex].Term)
+			DPrintf("{Follower %d(term: %d), PrevLogTerm: %d} mismatch {Leader %d(term:%d), PrevLogIndex: %d, PrevLogTerm: %d}",
+				rf.me, rf.CurrentTerm, rf.LogEntries[args.PrevLogIndex].Term, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 		}
 		return
 	}
@@ -509,7 +512,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 提交后该日志应用到状态机中
 	// TODO: 如何防止old leader提交命令
 	// 提交命令前进行一次心跳判断是否还是leader
-	time.Sleep(time.Millisecond * 10)
+	// time.Sleep(time.Millisecond * 10)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.state != Leader {
@@ -535,6 +538,7 @@ func (rf *Raft) sendHeartBeat(heartType HeartType) {
 	rf.heartHeatTimer.reset(StableHeartBeatTimeout())
 	// 心跳包
 	if heartType == HeartsBeat {
+		heartLossCount := 0
 		for i := range rf.peers {
 			if i != rf.me {
 				args := &AppendEntriesArgs{}
@@ -545,7 +549,17 @@ func (rf *Raft) sendHeartBeat(heartType HeartType) {
 				args.PrevLogIndex = index
 				args.PrevLogTerm = rf.LogEntries[index].Term
 				go func(server int, appendArgs *AppendEntriesArgs) {
-					rf.handleHeartBeat(server, appendArgs)
+					ok := rf.handleHeartBeat(server, appendArgs)
+					// 发送心跳失败
+					if !ok {
+						rf.mu.Lock()
+						heartLossCount++
+						if heartLossCount > len(rf.peers)/2 {
+							DPrintf("{Leader %d(term: %d)-->Follower} cant communicate to other servers, logs length: %d.", rf.me, rf.CurrentTerm, len(rf.LogEntries))
+							rf.state = Follower
+						}
+						rf.mu.Unlock()
+					}
 				}(i, args)
 			}
 		}
@@ -572,23 +586,28 @@ func (rf *Raft) sendHeartBeat(heartType HeartType) {
 		}
 	}
 }
-func (rf *Raft) handleHeartBeat(server int, args *AppendEntriesArgs) {
+func (rf *Raft) handleHeartBeat(server int, args *AppendEntriesArgs) bool {
 	reply := &AppendEntriesReply{}
 	// TODO：可否在收不到一半的回复时将leader转换为follower？
 	// TODO: 发送心跳时没有匹配如何处理呢？是否需要和日志复制一样处理呢？
 	if rf.sendAppendEntries(server, args, reply) {
 		rf.mu.Lock()
+
 		// 处理心跳信息
 		if rf.CurrentTerm == args.Term {
 
 		}
 		rf.ModifyCurrentTerm(reply.Term)
 		rf.mu.Unlock()
+		return true
+	} else {
+		return false
 	}
 }
 func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 	for true {
 		reply := &AppendEntriesReply{}
+		// TODO: 实现nextIndex的快速回退，不然无法在指定时间内回退到正确的nextIndex
 		if rf.sendAppendEntries(server, args, reply) {
 			rf.mu.Lock()
 			// 任期相同
@@ -763,13 +782,10 @@ func (rf *Raft) ticker() {
 		if rf.heartHeatTimer.timeout() {
 			rf.mu.Lock()
 			if rf.state == Leader {
-				rf.mu.Unlock()
 				// leader给所有服务器发送心跳包
 				rf.sendHeartBeat(HeartsBeat)
-			} else {
-				rf.mu.Unlock()
 			}
-
+			rf.mu.Unlock()
 		}
 	}
 }
