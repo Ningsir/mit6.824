@@ -482,12 +482,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.LogEntries = append(rf.LogEntries, args.Entries[firstIndex:]...)
 		}
 		rf.persist()
-		DPrintf("{Follower %d(term: %d)} append entries, get last entry{%+v, index: %d}", rf.me, rf.CurrentTerm, rf.LogEntries[len(rf.LogEntries)-1], len(rf.LogEntries)-1)
+		DPrintf("{Follower %d(term: %d, commitIndex: %d)} append entries, get last entry{%+v, index: %d}, leaderCommit: %d",
+			rf.me, rf.CurrentTerm, rf.commitIndex, rf.LogEntries[len(rf.LogEntries)-1], len(rf.LogEntries)-1, args.LeaderCommit)
 	}
 	// 根据参数leaderCommit更新commitIndex
 	if args.LeaderCommit > rf.commitIndex {
-		// 为什么取最小值？
-		rf.commitIndex = Min(args.LeaderCommit, len(rf.LogEntries)-1)
+		// 是与最后一个新条目的索引取最小值
+		// 因为发送心跳时，日志条目为空，那么LeaderCommit可能大于最大索引
+		rf.commitIndex = Min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 		DPrintf("{Follower: %d (term: %d)} commit log {commitIndex: %d, term: %d}", rf.me, rf.CurrentTerm, rf.commitIndex, rf.LogEntries[rf.commitIndex].Term)
 	}
 	reply.Term = rf.CurrentTerm
@@ -608,20 +610,20 @@ func (rf *Raft) handleHeartBeat(server int, args *AppendEntriesArgs) bool {
 	// TODO: 发送心跳时没有匹配如何处理呢？是否需要和日志复制一样处理呢？
 	if rf.sendAppendEntries(server, args, reply) {
 		rf.mu.Lock()
-
-		// 处理心跳信息
-		if rf.CurrentTerm == args.Term {
-
+		// 处理日志不匹配的心跳信息
+		if rf.CurrentTerm == args.Term && rf.state == Leader && reply.Success == false {
+			// 为什么不能在心跳中修改nextIndex，
+			// index := rf.searchConflictLogIndex(reply)
+			// rf.nextIndex[server] = index
 		}
 		rf.ModifyCurrentTerm(reply.Term)
 		rf.mu.Unlock()
 		return true
-	} else {
-		return false
 	}
+	return false
 }
 func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
-	for true {
+	for rf.killed() == false {
 		reply := &AppendEntriesReply{}
 		// TODO: 实现nextIndex的快速回退，不然无法在指定时间内回退到正确的nextIndex
 		if rf.sendAppendEntries(server, args, reply) {
@@ -647,8 +649,8 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 					args.PrevLogTerm = rf.LogEntries[args.PrevLogIndex].Term
 					// Entries清空
 					args.Entries = append(args.Entries[:0], rf.LogEntries[args.PrevLogIndex+1:]...)
-					DPrintf("{Leader: %d (term: %d)} retry appending entries {index: %d -- %d, %+v} to follower %d, args: {prevLogIndex: %d, preLogTerm: %d, leaderCommit: %d}",
-						rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), args.Entries, server, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+					DPrintf("{Leader: %d (term: %d)} retry appending entries {index: %d -- %d} to follower %d, args: {prevLogIndex: %d, preLogTerm: %d, leaderCommit: %d}",
+						rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), server, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 					rf.mu.Unlock()
 					continue
 				} else { // 日志条目匹配上
@@ -659,8 +661,8 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 					rf.matchIndex[server] = Max(args.PrevLogIndex+len(args.Entries), rf.matchIndex[server])
 					// 遍历matchIndex查看是否需要提交
 					rf.commitLog()
-					DPrintf("Finished: {Leader: %d (term: %d)} append entries {index: %d -- %d, %v} to follower %d, matchIndex: %v, nextIndex: %v",
-						rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), args.Entries, server, rf.matchIndex, rf.nextIndex)
+					DPrintf("Finished: {Leader: %d (term: %d)} append entries {index: %d -- %d} to follower %d, matchIndex: %v, nextIndex: %v",
+						rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), server, rf.matchIndex, rf.nextIndex)
 					rf.mu.Unlock()
 					break
 				}
@@ -886,22 +888,29 @@ func (rf *Raft) initLeaderIndex() {
 }
 
 //
-// 应用到状态机
+// 应用到状态机，一次应用多条日志，不然效率太低，当日志太多的时候可能无法在给定时间内达成一致
 //
 func (rf *Raft) apply() {
 	for rf.killed() == false {
 		time.Sleep(time.Millisecond * 10)
 		rf.mu.Lock()
 		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
-			msg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.LogEntries[rf.lastApplied].Command,
-				CommandIndex: rf.lastApplied,
+			entries := make([]Log, rf.commitIndex-rf.lastApplied)
+			copy(entries, rf.LogEntries[rf.lastApplied+1:rf.commitIndex+1])
+			commitIndex := rf.commitIndex
+			rf.mu.Unlock()
+			for i, log := range entries {
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      log.Command,
+					CommandIndex: i + rf.lastApplied + 1,
+				}
+				rf.applyCh <- msg
 			}
-			rf.applyCh <- msg
-			DPrintf("{Peer %d(term: %d)} apply log {index: %d, entries: %+v}", rf.me, rf.CurrentTerm, rf.lastApplied, rf.LogEntries[rf.lastApplied])
+			rf.lastApplied = commitIndex
+			DPrintf("{Peer %d(term: %d)} apply logs {index: (%d, %d]}", rf.me, rf.CurrentTerm, rf.lastApplied-len(entries), rf.lastApplied)
+		} else {
+			rf.mu.Unlock()
 		}
-		rf.mu.Unlock()
 	}
 }
