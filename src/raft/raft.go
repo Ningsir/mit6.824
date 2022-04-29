@@ -192,6 +192,9 @@ func (rf *Raft) persist() {
 	// rf.mu.Lock()
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.VotedFor)
+	// logs := make([]Log, len(rf.LogEntries))
+	// copy(logs, rf.LogEntries)
+	// e.Encode(logs)
 	e.Encode(rf.LogEntries)
 	e.Encode(rf.LastIncludedIndex)
 	e.Encode(rf.LastIncludedTerm)
@@ -260,13 +263,19 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	} else {
 		rf.LogEntries = rf.LogEntries[lastIncludedIndex+1-firstIndex:]
 	}
-	rf.lastApplied = lastIncludedIndex
-	rf.commitIndex = lastIncludedIndex
+	rf.lastApplied = Max(lastIncludedIndex, rf.lastApplied)
+	rf.commitIndex = Max(lastIncludedIndex, rf.commitIndex)
 	rf.persist()
 	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 	DPrintf("{Peer: %d(Term: %d)} CondInstallSnapshot:{lastIncludeIndex: %d, lastIncludeTerm: %d}, the length of the rest of logs: %d",
 		rf.me, rf.CurrentTerm, rf.LastIncludedIndex, rf.LastIncludedTerm, len(rf.LogEntries))
 	return true
+}
+
+func LogTrim(logs []Log) []Log {
+	res := append([]Log{}, logs...)
+	logs = nil
+	return res
 }
 
 // the service says it has created a snapshot that has
@@ -287,7 +296,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.LastIncludedIndex = index
 		rf.LastIncludedTerm = rf.LogEntries[index-firstIndex].Term
 		// 截断日志，那么nextIndex, matchIndex, commitIndex, lastApplied, prevLogIndex都需要做出相应调整
-		rf.LogEntries = rf.LogEntries[index+1-firstIndex:]
+		rf.LogEntries = LogTrim(rf.LogEntries[index+1-firstIndex:])
 		rf.persist()
 		rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 		DPrintf("{Peer: %d(Term: %d)} create snapshot:{lastIncludeIndex: %d, lastIncludeTerm: %d}, the length of the rest of logs: %d",
@@ -338,9 +347,9 @@ func (rf *Raft) handleInstallSnapshot(server int) {
 	args.LastIncludedTerm = rf.LastIncludedTerm
 	args.Data = rf.persister.ReadSnapshot()
 	reply := &InstallSnapshotReply{}
-	rf.mu.Unlock()
 	DPrintf("{Leader: %d(Term: %d)} send snapshot to {server: %d}, lastIncludeIndex: %d, lastIncludedTerm: %d",
 		rf.me, rf.CurrentTerm, server, args.LastIncludedIndex, args.LastIncludedTerm)
+	rf.mu.Unlock()
 	if rf.sendInstallSnapshot(server, args, reply) {
 		rf.mu.Lock()
 		if args.Term == rf.CurrentTerm && rf.state == Leader {
@@ -611,11 +620,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// 发生冲突
 		if index != -1 {
-			rf.LogEntries = append(rf.LogEntries[:index], args.Entries[index-1-args.PrevLogIndex+firstIndex:]...)
+			rf.LogEntries = LogTrim(append(rf.LogEntries[:index], args.Entries[index-1-args.PrevLogIndex+firstIndex:]...))
 		} else if len(args.Entries)+args.PrevLogIndex+1 > len(rf.LogEntries)+firstIndex {
 			//  2. 追加日志中尚未存在的任何新条目
 			first := len(rf.LogEntries) - args.PrevLogIndex - 1 + firstIndex
-			rf.LogEntries = append(rf.LogEntries, args.Entries[first:]...)
+			rf.LogEntries = LogTrim(append(rf.LogEntries, args.Entries[first:]...))
 		}
 		rf.persist()
 		DPrintf("{Follower %d(term: %d, commitIndex: %d)} append entries, get last entry{%+v, index: %d}, leaderCommit: %d",
@@ -668,7 +677,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 	log := Log{command, rf.CurrentTerm}
-	rf.LogEntries = append(rf.LogEntries, log)
+	rf.LogEntries = LogTrim(append(rf.LogEntries, log))
 	rf.persist()
 	// 利用日志的长度更新自身的nextIndex和matchIndex
 	rf.nextIndex[rf.me] = len(rf.LogEntries) + firstIndex
@@ -710,13 +719,13 @@ func (rf *Raft) append(server int) {
 		DPrintf("Server %d start to append", server)
 		rf.mu.Lock()
 		index := rf.nextIndex[server] - 1
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 		// 发送快照
 		if index+1 < rf.FirstIndex() {
 			go rf.handleInstallSnapshot(server)
 		} else {
 			// 参数
-			rf.mu.Lock()
+			// rf.mu.Lock()
 			args := &AppendEntriesArgs{}
 			args.Term = rf.CurrentTerm
 			args.LeaderId = rf.me
@@ -728,12 +737,14 @@ func (rf *Raft) append(server int) {
 			} else {
 				args.PrevLogTerm = rf.LogEntries[args.PrevLogIndex-rf.FirstIndex()].Term
 			}
-			args.Entries = append(args.Entries, rf.LogEntries[index+1-rf.FirstIndex():]...)
-			rf.mu.Unlock()
+			args.Entries = LogTrim(append(args.Entries, rf.LogEntries[index+1-rf.FirstIndex():]...))
+
 			DPrintf("{Leader: %d (term: %d)} append entries {index: %d -- %d} to follower %d, args: {prevLogIndex: %d, preLogTerm: %d, leaderCommit: %d}",
 				rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), server, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+			// rf.mu.Unlock()
 			go rf.handleAppendEntries1(server, args)
 		}
+		rf.mu.Unlock()
 		time.Sleep(time.Millisecond * 20)
 	}
 	DPrintf("Follower %d stop append routine", server)
@@ -913,7 +924,7 @@ func (rf *Raft) handleAppendEntries(server int, args *AppendEntriesArgs) {
 					args.LeaderCommit = rf.commitIndex
 					// start和handleAppendEntries应该是一个整体
 					// Entries清空
-					args.Entries = append(args.Entries[:0], rf.LogEntries[args.PrevLogIndex+1-rf.FirstIndex():]...)
+					args.Entries = LogTrim(append(args.Entries[:0], rf.LogEntries[args.PrevLogIndex+1-rf.FirstIndex():]...))
 					DPrintf("{Leader: %d (term: %d)} retry appending entries {index: %d -- %d} to follower %d, args: {prevLogIndex: %d, preLogTerm: %d, leaderCommit: %d}",
 						rf.me, rf.CurrentTerm, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries), server, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 					rf.mu.Unlock()
@@ -1118,7 +1129,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartHeatTimer = &Timer{}
 	rf.heartHeatTimer.reset(StableHeartBeatTimeout())
 	rf.state = Follower
-	rf.LogEntries = append(rf.LogEntries, Log{nil, rf.CurrentTerm})
+	rf.LogEntries = LogTrim(append(rf.LogEntries, Log{nil, rf.CurrentTerm}))
 	rf.LastIncludedIndex = -1
 	// 初始化持久性状态：CurrentTerm, VotedFor, LogEntries
 	// initialize from state persisted before a crash
@@ -1174,13 +1185,14 @@ func (rf *Raft) apply() {
 			// TODO: out of range
 			// 不能初始化为0
 			copy(entries, rf.LogEntries[rf.lastApplied+1-firstIndex:rf.commitIndex+1-firstIndex])
+			lastApplied := rf.lastApplied
 			commitIndex := rf.commitIndex
 			rf.mu.Unlock()
 			for i, log := range entries {
 				msg := ApplyMsg{
 					CommandValid: true,
 					Command:      log.Command,
-					CommandIndex: i + rf.lastApplied + 1,
+					CommandIndex: i + lastApplied + 1,
 				}
 				rf.applyCh <- msg
 			}
