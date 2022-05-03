@@ -90,28 +90,45 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	kv.mu.Lock()
-	id, ok := kv.clientLastApplied[args.ClientId]
-	kv.mu.Unlock()
-	// 命令已经被执行过
-	if ok && id.commandId == args.Id {
-		reply.Err = OK
-		reply.Value = id.response
-		return
-	}
-	DPrintf("Server %d Get args: %+v", kv.me, args)
+	// kv.mu.Lock()
+	// id, ok := kv.clientLastApplied[args.ClientId]
+	// kv.mu.Unlock()
+	// // 命令已经被执行过
+	// if ok && id.commandId == args.Id {
+	// 	reply.Err = OK
+	// 	reply.Value = id.response
+	// 	return
+	// }
+	DPrintf("Server %d Get args: %+v, command index: %d", kv.me, args, index)
 	for true {
 		time.Sleep(time.Millisecond * 10)
 		kv.mu.Lock()
-		value, ok := kv.commandResult[index]
+		_, ok := kv.commandResult[index]
 		// 已经应用到状态机
 		if ok {
-			reply.Err = OK
-			reply.Value = value
+			// reply.Err = OK
+			// reply.Value = value
+			// 返回前执行命令从而拿到最新值
+			// 因为Sleep了一段时间具有延迟性，所以需要在此拿到最新值返回给客户端
+			value, ok := kv.data[args.Key]
+			if ok {
+				reply.Err = OK
+				reply.Value = value
+			} else {
+				reply.Err = ErrNoKey
+			}
 			delete(kv.commandResult, index)
 			kv.mu.Unlock()
 			return
 		}
+		// id, ok := kv.clientLastApplied[args.ClientId]
+		// // 命令已经被执行过
+		// if ok && id.commandId == args.Id {
+		// 	reply.Err = OK
+		// 	reply.Value = id.response
+		// 	kv.mu.Unlock()
+		// 	return
+		// }
 		// _, ok := kv.hasApplied[args.Id]
 		// // 已经应用到状态机
 		// if ok {
@@ -163,7 +180,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("Server %d PutAppend args: %+v", kv.me, args)
+	DPrintf("Server %d PutAppend args: %+v, command index: %d", kv.me, args, index)
 	// TODO: 使用循环判断命令是否被执行，然后再返回给客户端，不能及时返回结果，具有一定延迟
 	// 条件变量？
 	for true {
@@ -175,6 +192,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		if ok {
 			reply.Err = OK
 			delete(kv.commandResult, index)
+			kv.mu.Unlock()
+			return
+		}
+		id, ok := kv.clientLastApplied[args.ClientId]
+		// 命令已经被执行过
+		if ok && id.commandId == args.Id {
+			reply.Err = OK
 			kv.mu.Unlock()
 			return
 		}
@@ -260,16 +284,18 @@ func (kv *KVServer) readSnapshot(snapshot []byte) {
 	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
-	var data map[string]string
-	var clientMap map[int64]IdAndResponse
+	// var data map[string]string
+	data := make(map[string]string)
+	clientMap := make(map[int64]IdAndResponse)
+	// var clientMap map[int64]IdAndResponse
 	if d.Decode(&data) != nil && d.Decode(&clientMap) != nil {
 		DPrintf("ReadSnapshot Decode error")
 	} else {
 		kv.mu.Lock()
 		kv.data = data
 		kv.clientLastApplied = clientMap
+		DPrintf("server %d read sanpshot: %+v, clientLastApplied: %+v", kv.me, data, clientMap)
 		kv.mu.Unlock()
-		DPrintf("server %d read sanpshot: %+v", kv.me, data)
 	}
 }
 func (kv *KVServer) executeCommand(op Op) string {
@@ -318,12 +344,18 @@ func (kv *KVServer) applier() {
 			}
 			// 执行对应命令, 并将结果写入commandResult
 			res := kv.executeCommand(op)
-			kv.commandResult[m.CommandIndex] = res
+			// 不是leader也会存储结果，占用大量内存
+			_, isLeader := kv.rf.GetState()
+			if isLeader {
+				kv.commandResult[m.CommandIndex] = res
+			}
 			// 执行完的命令如何将结果返回给客户端呢
 			// index: response
 			// 表示该条命令已经被应用到状态机
 			// kv.hasApplied[op.Id] = true
-			kv.clientLastApplied[op.ClientId] = IdAndResponse{op.Id, res}
+			if op.Type != GET {
+				kv.clientLastApplied[op.ClientId] = IdAndResponse{op.Id, res}
+			}
 			kv.mu.Unlock()
 			// 快照包括当前复制状态机的数据
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {

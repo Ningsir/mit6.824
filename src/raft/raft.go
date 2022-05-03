@@ -19,6 +19,7 @@ package raft
 
 import (
 	"bytes"
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -297,6 +298,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.LastIncludedTerm = rf.LogEntries[index-firstIndex].Term
 		// 截断日志，那么nextIndex, matchIndex, commitIndex, lastApplied, prevLogIndex都需要做出相应调整
 		rf.LogEntries = LogTrim(rf.LogEntries[index+1-firstIndex:])
+		rf.lastApplied = Max(index, rf.lastApplied)
+		rf.commitIndex = Max(index, rf.commitIndex)
 		rf.persist()
 		rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 		DPrintf("{Peer: %d(Term: %d)} create snapshot:{lastIncludeIndex: %d, lastIncludeTerm: %d}, the length of the rest of logs: %d",
@@ -307,9 +310,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	// follower安装快照，并将快照传递给服务端
 	// 还有可能leader两次append，那么就出现两次调用两轮InstallSnapshot
+	rf.mu.Lock()
 	DPrintf("{Server: %d(Term: %d)} receive snapshot from {leader %d}, lastIncludeIndex: %d, lastIncludedTerm: %d",
 		rf.me, rf.CurrentTerm, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
-	rf.mu.Lock()
 	rf.electionTimer.reset(RandomElectionTimeout())
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
@@ -690,7 +693,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) startAppend() {
-	DPrintf("Server: %d(term: %d) start append", rf.me, rf.CurrentTerm)
+	DPrintf("Server: %d(term: %d) starts append routine", rf.me, rf.CurrentTerm)
 	for i := range rf.peers {
 		if i != rf.me {
 			go rf.append(i)
@@ -710,13 +713,13 @@ func (rf *Raft) append(server int) {
 	rf.conds[server].L.Lock()
 	defer rf.conds[server].L.Unlock()
 	for rf.killed() == false {
-		DPrintf("Server %d prepare to append", server)
+		DPrintf("Server %d prepares to append to %d", rf.me, server)
 		// 没有新的log需要append, 则一直阻塞
 		for !rf.needAppend(server) {
-			DPrintf("Server %d append blocking", server)
+			DPrintf("Server %d appends blocking %d", rf.me, server)
 			rf.conds[server].Wait()
 		}
-		DPrintf("Server %d start to append", server)
+		DPrintf("Server %d starts to append to %d", rf.me, server)
 		rf.mu.Lock()
 		index := rf.nextIndex[server] - 1
 		// rf.mu.Unlock()
@@ -833,7 +836,9 @@ func (rf *Raft) sendHeartBeat(heartType HeartType) {
 		// 唤醒append(i)协程
 		for i := range rf.peers {
 			if i != rf.me {
+				// rf.conds[i].L.Lock()
 				rf.conds[i].Signal()
+				// rf.conds[i].L.Unlock()
 			}
 		}
 		// for i := range rf.peers {
@@ -1050,11 +1055,13 @@ func (rf *Raft) startElection() {
 								// 发送心跳包
 								rf.sendHeartBeat(HeartsBeat)
 								// 唤醒append协程
-								for i := range rf.peers {
-									if i != rf.me {
-										rf.conds[i].Signal()
-									}
-								}
+								// for i := range rf.peers {
+								// 	if i != rf.me {
+								// 		rf.conds[i].L.Lock()
+								// 		rf.conds[i].Signal()
+								// 		rf.conds[i].L.Unlock()
+								// 	}
+								// }
 							}
 							DPrintf("peer %d get vote from %d", rf.me, server)
 						} else {
@@ -1184,6 +1191,9 @@ func (rf *Raft) apply() {
 			firstIndex := rf.FirstIndex()
 			// TODO: out of range
 			// 不能初始化为0
+			if rf.lastApplied+1 < firstIndex {
+				log.Fatalf("Server %d: lastApplied %d < firstIndex %d", rf.me, rf.lastApplied, firstIndex)
+			}
 			copy(entries, rf.LogEntries[rf.lastApplied+1-firstIndex:rf.commitIndex+1-firstIndex])
 			lastApplied := rf.lastApplied
 			commitIndex := rf.commitIndex
