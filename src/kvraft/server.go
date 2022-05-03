@@ -44,8 +44,8 @@ type Op struct {
 }
 
 type IdAndResponse struct {
-	commandId int64
-	response  string
+	CommandId int64
+	Response  string
 }
 
 type KVServer struct {
@@ -70,6 +70,17 @@ type KVServer struct {
 	commandResult map[int]string
 }
 
+func (kv *KVServer) duplicateCommand(op Op) bool {
+	// kv.mu.Lock()
+	// defer kv.mu.Unlock()
+	value, ok := kv.clientLastApplied[op.ClientId]
+	// 命令已经被执行过
+	if ok && value.CommandId >= op.Id {
+		DPrintf("Server %d: duplicate command: %+v, clientLastAplied: %v", kv.me, op, kv.clientLastApplied)
+		return true
+	}
+	return false
+}
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	// 1. 如何知道已经应用到状态机？
@@ -90,15 +101,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	// kv.mu.Lock()
-	// id, ok := kv.clientLastApplied[args.ClientId]
-	// kv.mu.Unlock()
-	// // 命令已经被执行过
-	// if ok && id.commandId == args.Id {
-	// 	reply.Err = OK
-	// 	reply.Value = id.response
-	// 	return
-	// }
 	DPrintf("Server %d Get args: %+v, command index: %d", kv.me, args, index)
 	for true {
 		time.Sleep(time.Millisecond * 10)
@@ -106,8 +108,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		_, ok := kv.commandResult[index]
 		// 已经应用到状态机
 		if ok {
-			// reply.Err = OK
-			// reply.Value = value
 			// 返回前执行命令从而拿到最新值
 			// 因为Sleep了一段时间具有延迟性，所以需要在此拿到最新值返回给客户端
 			value, ok := kv.data[args.Key]
@@ -121,27 +121,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			kv.mu.Unlock()
 			return
 		}
-		// id, ok := kv.clientLastApplied[args.ClientId]
-		// // 命令已经被执行过
-		// if ok && id.commandId == args.Id {
-		// 	reply.Err = OK
-		// 	reply.Value = id.response
-		// 	kv.mu.Unlock()
-		// 	return
-		// }
-		// _, ok := kv.hasApplied[args.Id]
-		// // 已经应用到状态机
-		// if ok {
-		// 	value, ok := kv.data[args.Key]
-		// 	if ok {
-		// 		reply.Err = OK
-		// 		reply.Value = value
-		// 	} else {
-		// 		reply.Err = ErrNoKey
-		// 	}
-		// 	kv.mu.Unlock()
-		// 	return
-		// }
 		var currentTerm int
 		currentTerm, isLeader = kv.rf.GetState()
 		// 不再是leader
@@ -168,13 +147,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	kv.mu.Lock()
-	id, ok := kv.clientLastApplied[args.ClientId]
-	kv.mu.Unlock()
-	// 命令已经被执行过
-	if ok && id.commandId == args.Id {
+	if kv.duplicateCommand(op) {
 		reply.Err = OK
+		kv.mu.Unlock()
 		return
 	}
+	kv.mu.Unlock()
 	index, oldTerm, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -195,13 +173,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			kv.mu.Unlock()
 			return
 		}
-		id, ok := kv.clientLastApplied[args.ClientId]
-		// 命令已经被执行过
-		if ok && id.commandId == args.Id {
+		if kv.duplicateCommand(op) {
 			reply.Err = OK
 			kv.mu.Unlock()
 			return
 		}
+		kv.mu.Unlock()
 		var currentTerm int
 		currentTerm, isLeader = kv.rf.GetState()
 		// leader->follower->leader没有察觉出来已经进行了一次leader选举
@@ -209,10 +186,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		if !isLeader || oldTerm != currentTerm {
 			DPrintf("Old leader %d, old term %d to new term %d", kv.me, oldTerm, currentTerm)
 			reply.Err = ErrWrongLeader
-			kv.mu.Unlock()
 			return
 		}
-		kv.mu.Unlock()
 	}
 }
 
@@ -288,13 +263,13 @@ func (kv *KVServer) readSnapshot(snapshot []byte) {
 	data := make(map[string]string)
 	clientMap := make(map[int64]IdAndResponse)
 	// var clientMap map[int64]IdAndResponse
-	if d.Decode(&data) != nil && d.Decode(&clientMap) != nil {
-		DPrintf("ReadSnapshot Decode error")
+	if d.Decode(&data) != nil || d.Decode(&clientMap) != nil {
+		log.Fatalf("ReadSnapshot Decode error")
 	} else {
 		kv.mu.Lock()
 		kv.data = data
 		kv.clientLastApplied = clientMap
-		DPrintf("server %d read sanpshot: %+v, clientLastApplied: %+v", kv.me, data, clientMap)
+		DPrintf("server %d read sanpshot: %+v, clientLastApplied: %+v", kv.me, kv.data, kv.clientLastApplied)
 		kv.mu.Unlock()
 	}
 }
@@ -331,31 +306,26 @@ func (kv *KVServer) applier() {
 				DPrintf("Server %d Installsnapshot: get old snapshot", kv.me)
 			}
 		} else if m.CommandValid && m.CommandIndex > kv.lastApplied {
-			DPrintf("Server %d apply commandIndex %v lastApplied %v, command: %+v\n", kv.me, m.CommandIndex, kv.lastApplied, m.Command)
 			kv.mu.Lock()
 			kv.lastApplied = m.CommandIndex
 			// interface转换为struct
 			op := m.Command.(Op)
-			id, ok := kv.clientLastApplied[op.ClientId]
-			// 命令已经执行过
-			if ok && id.commandId == op.Id {
+			// 重复的命令直接跳过
+			if kv.duplicateCommand(op) {
 				kv.mu.Unlock()
 				continue
 			}
 			// 执行对应命令, 并将结果写入commandResult
 			res := kv.executeCommand(op)
 			// 不是leader也会存储结果，占用大量内存
-			_, isLeader := kv.rf.GetState()
-			if isLeader {
+			if _, isLeader := kv.rf.GetState(); isLeader {
 				kv.commandResult[m.CommandIndex] = res
 			}
-			// 执行完的命令如何将结果返回给客户端呢
-			// index: response
-			// 表示该条命令已经被应用到状态机
-			// kv.hasApplied[op.Id] = true
+			// read命令可以重复执行
 			if op.Type != GET {
 				kv.clientLastApplied[op.ClientId] = IdAndResponse{op.Id, res}
 			}
+			DPrintf("Server %d apply commandIndex %v lastApplied %v, command: %+v\n", kv.me, m.CommandIndex, kv.lastApplied, m.Command)
 			kv.mu.Unlock()
 			// 快照包括当前复制状态机的数据
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
@@ -363,15 +333,17 @@ func (kv *KVServer) applier() {
 					kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, m.CommandIndex)
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
+				// encode：或者使用大写字段的结构体，或者将其复制到另外字段
 				v := kv.data
+				clientLastApplied := kv.clientLastApplied
 				e.Encode(v)
-				e.Encode(kv.clientLastApplied)
+				e.Encode(clientLastApplied)
 				kv.rf.Snapshot(m.CommandIndex, w.Bytes())
-				DPrintf("Server %d Finish Install Snapshot, raft size: %d, lastIncudedIndex: %d",
-					kv.me, kv.persister.RaftStateSize(), m.CommandIndex)
+				DPrintf("Server %d Finish Install Snapshot, snapshot size: %d, raft size: %d, lastIncudedIndex: %d, clientLastAplied:%+v",
+					kv.me, len(w.Bytes()), kv.persister.RaftStateSize(), m.CommandIndex, kv.clientLastApplied)
 			}
 		} else {
-			DPrintf("Ignore: Index %v lastApplied %v\n", m.CommandIndex, kv.lastApplied)
+			DPrintf("Server %d Ignore: Index %v lastApplied %v, applyCh: %+v\n", kv.me, m.CommandIndex, kv.lastApplied, m)
 		}
 	}
 	DPrintf("Node: %d applier finished", kv.me)

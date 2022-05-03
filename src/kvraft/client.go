@@ -3,6 +3,7 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
+	"sync"
 
 	"6.824/labrpc"
 )
@@ -11,8 +12,10 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	// 上一轮leader
-	lastLeader int
-	clientId   int64
+	lastLeader  int
+	clientId    int64
+	sequenceNum int64
+	mu          sync.Mutex
 }
 
 func nrand() int64 {
@@ -28,6 +31,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.lastLeader = 0
 	ck.clientId = nrand()
+	ck.sequenceNum = 0
 	return ck
 }
 
@@ -47,7 +51,11 @@ func (ck *Clerk) Get(key string) string {
 
 	numServers := len(ck.servers)
 	// TODO: 如何保证每一条命令的ID不同
-	args := &GetArgs{key, nrand(), ck.clientId}
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := &GetArgs{key, ck.sequenceNum, ck.clientId}
+	ck.sequenceNum += 1
+	// ck.mu.Unlock()
 	reply := &GetReply{}
 	for i := ck.lastLeader; i < numServers; i = (i + 1) % numServers {
 		if ck.servers[i].Call("KVServer.Get", args, reply) {
@@ -80,7 +88,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	numServers := len(ck.servers)
 	// TODO: 如何保证每一条命令的ID不同
-	args := &PutAppendArgs{key, value, op, nrand(), ck.clientId}
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := &PutAppendArgs{key, value, op, ck.sequenceNum, ck.clientId}
+	ck.sequenceNum += 1
 	reply := &PutAppendReply{}
 	for i := ck.lastLeader; i < numServers; i = (i + 1) % numServers {
 		if ck.servers[i].Call("KVServer.PutAppend", args, reply) {
