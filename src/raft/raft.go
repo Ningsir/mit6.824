@@ -1197,6 +1197,8 @@ func (rf *Raft) apply() {
 			copy(entries, rf.LogEntries[rf.lastApplied+1-firstIndex:rf.commitIndex+1-firstIndex])
 			lastApplied := rf.lastApplied
 			commitIndex := rf.commitIndex
+			rf.lastApplied = commitIndex
+			DPrintf("{Peer %d(term: %d)} apply logs {index: (%d, %d]}", rf.me, rf.CurrentTerm, rf.lastApplied-len(entries), rf.lastApplied)
 			rf.mu.Unlock()
 			for i, log := range entries {
 				msg := ApplyMsg{
@@ -1206,10 +1208,6 @@ func (rf *Raft) apply() {
 				}
 				rf.applyCh <- msg
 			}
-			rf.mu.Lock()
-			rf.lastApplied = commitIndex
-			DPrintf("{Peer %d(term: %d)} apply logs {index: (%d, %d]}", rf.me, rf.CurrentTerm, rf.lastApplied-len(entries), rf.lastApplied)
-			rf.mu.Unlock()
 		} else {
 			rf.mu.Unlock()
 		}
