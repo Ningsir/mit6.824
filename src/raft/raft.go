@@ -123,10 +123,12 @@ type Raft struct {
 	LastIncludedIndex int
 	// 最后一个被包含在快照中的日志的任期
 	LastIncludedTerm int
-	// FirstIndex        int
 
 	// 条件变量
+	// 用于日志复制的条件变量
 	conds []*sync.Cond
+	// 用于applier协程的条件变量
+	applierCond *sync.Cond
 }
 
 //
@@ -249,27 +251,6 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// 旧的快照，直接丢弃
-	if rf.commitIndex >= lastIncludedIndex {
-		return false
-	}
-	firstIndex := rf.firstIndexWithoutLock()
-	rf.LastIncludedIndex = lastIncludedIndex
-	rf.LastIncludedTerm = lastIncludedTerm
-	// 截断日志，那么nextIndex, matchIndex, commitIndex, lastApplied, prevLogIndex都需要做出相应调整
-	if lastIncludedIndex >= firstIndex+len(rf.LogEntries) {
-		rf.LogEntries = rf.LogEntries[:0]
-	} else {
-		rf.LogEntries = rf.LogEntries[lastIncludedIndex+1-firstIndex:]
-	}
-	rf.lastApplied = Max(lastIncludedIndex, rf.lastApplied)
-	rf.commitIndex = Max(lastIncludedIndex, rf.commitIndex)
-	rf.persist()
-	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
-	DPrintf("{Peer=%d(Term=%d, lastApplied=%d, commitIndex=%d)} CondInstallSnapshot:{lastIncludeIndex=%d, lastIncludeTerm=%d}, the length of the rest of logs: %d",
-		rf.me, rf.CurrentTerm, rf.lastApplied, rf.commitIndex, rf.LastIncludedIndex, rf.LastIncludedTerm, len(rf.LogEntries))
 	return true
 }
 
@@ -424,6 +405,7 @@ func (rf *Raft) commitLog() {
 	N := matchCopy[mid]
 	if N > rf.commitIndex && rf.LogEntries[N-rf.firstIndexWithoutLock()].Term == rf.CurrentTerm {
 		rf.commitIndex = N
+		rf.condWakeUpApplier()
 		DPrintf("{Leader=%d(Term=%d)} commits log --> commitIndex=%d", rf.me, rf.CurrentTerm, rf.commitIndex)
 	}
 }
@@ -454,8 +436,8 @@ func (rf *Raft) handleAppendAndHeartBeat(server int, args *AppendEntriesArgs, re
 			rf.matchIndex[server] = Max(args.PrevLogIndex+len(args.Entries), rf.matchIndex[server])
 			// 遍历matchIndex查看是否需要提交
 			rf.commitLog()
-			DPrintf("Finish Appending Entries: {Leader=%d(term=%d)} finishes appending entries to Follower=%d with {index=[%d, %d), matchIndex=%d, nextIndex=%d, entries=%+v}",
-				args.LeaderId, args.Term, server, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries)+1, rf.matchIndex[server], rf.nextIndex[server], args.Entries)
+			DPrintf("Finish Appending Entries: {Leader=%d(Term=%d, state=%d)} finishes appending entries to Follower=%d with {index=[%d, %d), matchIndex=%d, nextIndex=%d, entries=%+v}",
+				args.LeaderId, args.Term, rf.state, server, args.PrevLogIndex+1, args.PrevLogIndex+len(args.Entries)+1, rf.matchIndex[server], rf.nextIndex[server], args.Entries)
 			return
 		}
 	}
@@ -488,9 +470,11 @@ func (rf *Raft) needAppend(server int) bool {
 }
 
 //
-// 对于一个Follower，同一时间只会有一个来自Leader的append请求，
-// 在没有获取到relpy之前不会发送其他append请求
-// TODO: 如果Follower是reconnect或者重启，那么怎么唤醒呢？
+// 对于一个Follower，同一时间可能会收到来自Leader的多个append请求，所以需要注意那些过时的请求。
+// 问题：如果Follower是reconnect或者重启，那么怎么唤醒呢？
+// 不需要唤醒，如果存在日志没有复制到该Follower，那么就不会阻塞，所以也就不需要唤醒。
+// TODO: sendInstallSnapshot 和 sendAppendEntries设置一个timeout, 如果在timeout时间内没有获取到结果就发起下一轮请求
+// 本身是存在timeout的，但是其timeout太大，导致append效率比较低。
 //
 func (rf *Raft) appendLoop(server int) {
 	for rf.killed() == false {
@@ -502,14 +486,18 @@ func (rf *Raft) appendLoop(server int) {
 			rf.mu.Unlock()
 			rf.conds[server].Wait()
 		}
-		rf.sendAppend(server)
+		// 如果不使用协程，必须等到前一轮append结束才能执行下一轮的append
+		// 那么如果出现网络故障，就必须等到请求超时才能执行下一轮的append，导致效率低下。
+		go rf.sendAppend(server)
 		rf.conds[server].L.Unlock()
+		// 等到超时即发送下一轮append请求
+		time.Sleep(time.Millisecond * 100)
 	}
 }
 
-func (rf *Raft) getAppendArgs(server int) AppendEntriesArgs {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (rf *Raft) getAppendArgsWithoutLock(server int) AppendEntriesArgs {
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
 	args := AppendEntriesArgs{}
 	args.Term = rf.CurrentTerm
 	args.LeaderId = rf.me
@@ -521,13 +509,13 @@ func (rf *Raft) getAppendArgs(server int) AppendEntriesArgs {
 	} else {
 		args.PrevLogTerm = rf.LogEntries[args.PrevLogIndex-rf.firstIndexWithoutLock()].Term
 	}
-	args.Entries = rf.LogEntries[index+1-rf.firstIndexWithoutLock():]
+	args.Entries = make([]Log, len(rf.LogEntries[index+1-rf.firstIndexWithoutLock():]))
+	// 避免AppendEntries rpc修改args引起数据争用
+	copy(args.Entries, rf.LogEntries[index+1-rf.firstIndexWithoutLock():])
 	return args
 }
 
-func (rf *Raft) getInstallSnapshotArgs(server int) InstallSnapshotArgs {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+func (rf *Raft) getInstallSnapshotArgsWithoutLock(server int) InstallSnapshotArgs {
 	args := InstallSnapshotArgs{}
 	args.Term = rf.CurrentTerm
 	args.LeaderId = rf.me
@@ -537,42 +525,45 @@ func (rf *Raft) getInstallSnapshotArgs(server int) InstallSnapshotArgs {
 	return args
 }
 
-func (rf *Raft) needSendSnapshot(server int) bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.nextIndex[server] < rf.firstIndexWithoutLock()
+func (rf *Raft) needSendSnapshotWithoutLock(server int) bool {
+	return rf.nextIndex[server] < rf.firstIndexWithoutLock() && rf.state == Leader
+}
+
+func (rf *Raft) needAppendWithoutLock(server int) bool {
+	return rf.nextIndex[server] < rf.firstIndexWithoutLock()+len(rf.LogEntries) && rf.state == Leader
 }
 
 func (rf *Raft) sendAppend(server int) {
+	rf.mu.Lock()
+	// Note: 判断是否需要发送快照或者日志和获取rpc参数是一个整体，如果分别加锁，可能在获取参数的时候，并不满足条件。
 	// 发送快照
-	if rf.needSendSnapshot(server) {
-		args := rf.getInstallSnapshotArgs(server)
+	if rf.needSendSnapshotWithoutLock(server) {
+		args := rf.getInstallSnapshotArgsWithoutLock(server)
 		reply := &InstallSnapshotReply{}
-		rf.mu.Lock()
-		DPrintf("Start Send Snapshot: {Leader=%d(term=%d)} sends snapshot to Follower=%d(nextIndex=%d, matchIndex=%d) with {LastIncludedIndex=%d, LastIncludedTerm=%d}",
-			args.LeaderId, args.Term, server, rf.nextIndex[server], rf.matchIndex[server], args.LastIncludedIndex, args.LastIncludedTerm)
+		DPrintf("Start Send Snapshot: {Leader=%d(Term=%d, state=%d)} sends snapshot to Follower=%d(nextIndex=%d, matchIndex=%d) with {LastIncludedIndex=%d, LastIncludedTerm=%d}",
+			args.LeaderId, args.Term, rf.state, server, rf.nextIndex[server], rf.matchIndex[server], args.LastIncludedIndex, args.LastIncludedTerm)
 		rf.mu.Unlock()
 		if rf.sendInstallSnapshot(server, &args, reply) {
 			rf.handleInstallSnapshot(server, &args, reply)
 		} else {
-			DPrintf("WARNING: {Leader=%d(term=%d)} fails to send snapshot to Follower=%d with {LastIncludedIndex=%d, LastIncludedTerm=%d}",
+			DPrintf("WARNING: {Leader=%d(Term=%d)} fails to send snapshot to Follower=%d with {LastIncludedIndex=%d, LastIncludedTerm=%d}",
 				args.LeaderId, args.Term, server, args.LastIncludedIndex, args.LastIncludedTerm)
 		}
-	} else { // 发送日志
-		args := rf.getAppendArgs(server)
+	} else if rf.needAppendWithoutLock(server) { // 发送日志
+		args := rf.getAppendArgsWithoutLock(server)
 		reply := &AppendEntriesReply{}
 		// 避免AppendEntries rpc修改args引起数据争用
-		args_copy := DeepCopyAppendEntriesArgs(&args)
-		rf.mu.Lock()
-		DPrintf("Start Append: {Leader=%d(term=%d)} appends entries to Follower=%d(nextIndex=%d, matchIndex=%d) with args=%+v",
-			args.LeaderId, args.Term, server, rf.nextIndex[server], rf.matchIndex[server], args)
+		DPrintf("Start Append: {Leader=%d(Term=%d, state=%d)} appends entries to Follower=%d(nextIndex=%d, matchIndex=%d) with args=%+v",
+			args.LeaderId, args.Term, rf.state, server, rf.nextIndex[server], rf.matchIndex[server], args)
 		rf.mu.Unlock()
 		if rf.sendAppendEntries(server, &args, reply) {
 			rf.handleAppendAndHeartBeat(server, &args, reply)
 		} else {
-			DPrintf("WARNING: {Leader=%d(term=%d)} fails to append entries to Follower=%d with args=%+v",
-				args_copy.LeaderId, args_copy.Term, server, args_copy)
+			DPrintf("WARNING: {Leader=%d(Term=%d)} fails to append entries to Follower=%d with args=%+v",
+				args.LeaderId, args.Term, server, args)
 		}
+	} else {
+		rf.mu.Unlock()
 	}
 }
 
@@ -589,8 +580,8 @@ func (rf *Raft) handleInstallSnapshot(server int, args *InstallSnapshotArgs, rep
 			rf.matchIndex[server] = Max(args.LastIncludedIndex, rf.matchIndex[server])
 			// 遍历matchIndex查看是否需要提交
 			rf.commitLog()
-			DPrintf("Finish Sending Snapshot: {Leader=%d(Term=%d)} finishes handling InstallSnapshot to Follower=%d with {LastIncludedIndex=%d, LastIncludedTerm=%d}-->nextIndex=%d, matchIndex=%d",
-				args.LeaderId, args.Term, server, args.LastIncludedIndex, args.LastIncludedTerm, rf.nextIndex[server], rf.matchIndex[server])
+			DPrintf("Finish Sending Snapshot: {Leader=%d(Term=%d, state=%d)} finishes handling InstallSnapshot to Follower=%d with {LastIncludedIndex=%d, LastIncludedTerm=%d}-->nextIndex=%d, matchIndex=%d",
+				args.LeaderId, args.Term, rf.state, server, args.LastIncludedIndex, args.LastIncludedTerm, rf.nextIndex[server], rf.matchIndex[server])
 		}
 	}
 }
@@ -703,43 +694,58 @@ func (rf *Raft) ticker() {
 }
 
 //
-// TODO: 使用条件变量唤醒applier协程，不然一直空转，浪费资源
+// 唤醒applier协程
+//
+func (rf *Raft) condWakeUpApplier() {
+	if rf.commitIndex > rf.lastApplied {
+		rf.applierCond.Signal()
+		DPrintf("{Peer=%d(Term=%d)} wake up applier with {commitIndex=%d, lastApplied=%d}",
+			rf.me, rf.CurrentTerm, rf.commitIndex, rf.lastApplied)
+	}
+}
+
+func (rf *Raft) needApply() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex > rf.lastApplied
+}
+
+//
 // 应用到状态机，一次应用多条日志，不然效率太低，当日志太多的时候可能无法在给定时间内达成一致
 //
 func (rf *Raft) applier() {
 	for rf.killed() == false {
-		time.Sleep(time.Millisecond * 10)
-		rf.mu.Lock()
-		if rf.commitIndex > rf.lastApplied {
-			entries := make([]Log, rf.commitIndex-rf.lastApplied)
-			firstIndex := rf.firstIndexWithoutLock()
-			// TODO: out of range
-			// 不能初始化为0
-			if rf.lastApplied+1 < firstIndex {
-				log.Fatalf("Server %d: lastApplied %d < firstIndex %d", rf.me, rf.lastApplied, firstIndex)
-			}
-			copy(entries, rf.LogEntries[rf.lastApplied+1-firstIndex:rf.commitIndex+1-firstIndex])
-			lastApplied := rf.lastApplied
-			commitIndex := rf.commitIndex
-			// rf.lastApplied = commitIndex
-			// DPrintf("{Peer=%d(term=%d)} apply logs {index: (%d, %d]}", rf.me, rf.CurrentTerm, rf.lastApplied-len(entries), rf.lastApplied)
-			rf.mu.Unlock()
-			for i, log := range entries {
-				msg := ApplyMsg{
-					CommandValid: true,
-					Command:      log.Command,
-					CommandIndex: i + lastApplied + 1,
-				}
-				rf.applyCh <- msg
-			}
-			rf.mu.Lock()
-			// 不能使用rf.commitIndex修改lastApplied，因为rf.commitIndex可能在applier阶段被修改了
-			rf.lastApplied = commitIndex
-			DPrintf("{Peer=%d(term=%d)} apply logs {index: (%d, %d]}", rf.me, rf.CurrentTerm, rf.lastApplied-len(entries), rf.lastApplied)
-			rf.mu.Unlock()
-		} else {
-			rf.mu.Unlock()
+		rf.applierCond.L.Lock()
+		for !rf.needApply() {
+			rf.applierCond.Wait()
 		}
+		rf.mu.Lock()
+		entries := make([]Log, rf.commitIndex-rf.lastApplied)
+		firstIndex := rf.firstIndexWithoutLock()
+		if rf.lastApplied+1 < firstIndex {
+			log.Fatalf("Server %d: lastApplied %d < firstIndex %d", rf.me, rf.lastApplied, firstIndex)
+		}
+		copy(entries, rf.LogEntries[rf.lastApplied+1-firstIndex:rf.commitIndex+1-firstIndex])
+		lastApplied := rf.lastApplied
+		commitIndex := rf.commitIndex
+		// 先修改lastApplied再将日志传输到通道中，与InstallSnapshot保持一致
+		// 下面两项操作都是一个整体，如果在执行1修改lastApplied后, 再执行InstallSnapshot修改lastApplied,
+		// 然后再执行applyCh<-snapshot, 最后执行applyCh<-msg, 那么将导致apply out of order, 也就是将已经应用到状态机的日志再次应用到状态机。
+		// 1. applier: lastApplied->log->applyCh
+		// 2. InstallSnapshot: lastApplied->snapshot->applyCh
+		rf.lastApplied = commitIndex
+		DPrintf("{Peer=%d(term=%d)} apply logs {index: (%d, %d]}",
+			rf.me, rf.CurrentTerm, rf.lastApplied-len(entries), rf.lastApplied)
+		rf.mu.Unlock()
+		for i, log := range entries {
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      log.Command,
+				CommandIndex: i + lastApplied + 1,
+			}
+			rf.applyCh <- msg
+		}
+		rf.applierCond.L.Unlock()
 	}
 }
 
@@ -797,6 +803,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for i := range rf.conds {
 		rf.conds[i] = sync.NewCond(&sync.Mutex{})
 	}
+	rf.applierCond = sync.NewCond(&sync.Mutex{})
 	// 启动append协程
 	rf.bcastAppend()
 	// start ticker goroutine to start elections

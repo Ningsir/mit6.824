@@ -153,6 +153,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 是与最后一个新条目的索引取最小值
 		// 因为发送心跳时，日志条目为空，那么LeaderCommit可能大于最大索引
 		rf.commitIndex = Min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
+		rf.condWakeUpApplier()
 		DPrintf("{Follower=%d(Term=%d)} commits log {commitIndex=%d, lastApplied=%d}", rf.me, rf.CurrentTerm, rf.commitIndex, rf.lastApplied)
 	}
 	reply.Term = rf.CurrentTerm
@@ -177,9 +178,31 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 	rf.updateCurrentTermWithoutLock(args.Term)
+	// 旧的快照，直接丢弃
+	if rf.commitIndex >= args.LastIncludedIndex {
+		reply.Term = rf.CurrentTerm
+		rf.mu.Unlock()
+		return
+	}
+	firstIndex := rf.firstIndexWithoutLock()
+	rf.LastIncludedIndex = args.LastIncludedIndex
+	rf.LastIncludedTerm = args.LastIncludedTerm
+	// 截断日志，commitIndex, lastApplied需要做出相应调整
+	if args.LastIncludedIndex >= firstIndex+len(rf.LogEntries) {
+		rf.LogEntries = rf.LogEntries[:0]
+	} else {
+		rf.LogEntries = rf.LogEntries[args.LastIncludedIndex+1-firstIndex:]
+	}
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+	rf.persist()
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), args.Data)
+	DPrintf("{Peer=%d(Term=%d, lastApplied=%d, commitIndex=%d)} InstallSnapshot:{lastIncludeIndex=%d, lastIncludeTerm=%d}, the length of the rest of logs: %d",
+		rf.me, rf.CurrentTerm, rf.lastApplied, rf.commitIndex, rf.LastIncludedIndex, rf.LastIncludedTerm, len(rf.LogEntries))
 	rf.mu.Unlock()
 	// 1. 保存快照文件，丢弃具有较小索引的任何现有或部分快照
 	// 2. 如果现存的日志条目与快照中最后包含的日志条目具有相同的索引值和任期号，则保留其后的日志条目并进行回复
+
 	// 将快照发送给服务端
 	msg := ApplyMsg{
 		CommandValid:  false,
