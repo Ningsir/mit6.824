@@ -41,6 +41,8 @@ const (
 // 发送的快照块的最大大小
 const MaxSnapshotChunk int = 1024
 
+const RpcTimeout = time.Millisecond * 100
+
 type HeartType int
 
 const (
@@ -275,8 +277,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		// rf.commitIndex = Max(index, rf.commitIndex)
 		rf.persist()
 		rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
-		DPrintf("{Peer=%d(Term=%d)} create snapshot with {lastIncludeIndex=%d, lastIncludeTerm=%d}, the length of the rest of logs: %d",
-			rf.me, rf.CurrentTerm, rf.LastIncludedIndex, rf.LastIncludedTerm, len(rf.LogEntries))
+		DPrintf("{Peer=%d(Term=%d, state=%d)} create snapshot with {lastIncludeIndex=%d, lastIncludeTerm=%d}, the length of the rest of logs: %d",
+			rf.me, rf.CurrentTerm, rf.state, rf.LastIncludedIndex, rf.LastIncludedTerm, len(rf.LogEntries))
 	}
 }
 
@@ -314,8 +316,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.nextIndex[rf.me] = len(rf.LogEntries) + firstIndex
 	rf.matchIndex[rf.me] = len(rf.LogEntries) - 1 + firstIndex
 	index, term, isLeader = len(rf.LogEntries)-1+firstIndex, rf.CurrentTerm, true
-	DPrintf("{Leader=%d(term=%d)} append entries to self with {command=%v, index=%d}",
-		rf.me, rf.CurrentTerm, command, index)
+	DPrintf("{Leader=%d(Term=%d, state=%d)} append entries to self with {command=%v, index=%d}",
+		rf.me, rf.CurrentTerm, rf.state, command, index)
 	rf.wakeUpAppend()
 	return index, term, isLeader
 }
@@ -373,7 +375,7 @@ func (rf *Raft) sendHeartBeat(server int) {
 	if rf.sendAppendEntries(server, &args, reply) {
 		rf.handleAppendAndHeartBeat(server, &args, reply)
 	} else {
-		DPrintf("WARNING: {Leader=%d(term=%d)} fails to send heartbeat to Follower=%d with args=%+v",
+		DPrintf("WARNING: {Leader=%d(Term=%d)} fails to send heartbeat to Follower=%d with args=%+v",
 			args.LeaderId, args.Term, server, args)
 	}
 }
@@ -406,7 +408,8 @@ func (rf *Raft) commitLog() {
 	if N > rf.commitIndex && rf.LogEntries[N-rf.firstIndexWithoutLock()].Term == rf.CurrentTerm {
 		rf.commitIndex = N
 		rf.condWakeUpApplier()
-		DPrintf("{Leader=%d(Term=%d)} commits log --> commitIndex=%d", rf.me, rf.CurrentTerm, rf.commitIndex)
+		DPrintf("{Leader=%d(Term=%d, state=%d)} commits log --> commitIndex=%d",
+			rf.me, rf.CurrentTerm, rf.state, rf.commitIndex)
 	}
 }
 
@@ -473,31 +476,36 @@ func (rf *Raft) needAppend(server int) bool {
 // 对于一个Follower，同一时间可能会收到来自Leader的多个append请求，所以需要注意那些过时的请求。
 // 问题：如果Follower是reconnect或者重启，那么怎么唤醒呢？
 // 不需要唤醒，如果存在日志没有复制到该Follower，那么就不会阻塞，所以也就不需要唤醒。
-// TODO: sendInstallSnapshot 和 sendAppendEntries设置一个timeout, 如果在timeout时间内没有获取到结果就发起下一轮请求
-// 本身是存在timeout的，但是其timeout太大，导致append效率比较低。
 //
 func (rf *Raft) appendLoop(server int) {
 	for rf.killed() == false {
 		rf.conds[server].L.Lock()
 		// 没有新的log需要append或者不是leader, 则一直阻塞
-		for !rf.needAppend(server) {
-			rf.mu.Lock()
-			DPrintf("Current Peer=%d(state=%d) appends to Peer=%d waited", rf.me, rf.state, server)
+		rf.mu.Lock()
+		for !rf.needAppendWithoutLock(server) {
+			DPrintf("Current Peer=%d(state=%d, length of logs=%d) appends to Peer=%d(nextIndex=%d) waited",
+				rf.me, rf.state, rf.firstIndexWithoutLock()+len(rf.LogEntries), server, rf.nextIndex[server])
 			rf.mu.Unlock()
 			rf.conds[server].Wait()
+			rf.mu.Lock()
 		}
+		rf.mu.Unlock()
+		chFinished := make(chan int)
 		// 如果不使用协程，必须等到前一轮append结束才能执行下一轮的append
 		// 那么如果出现网络故障，就必须等到请求超时才能执行下一轮的append，导致效率低下。
-		go rf.sendAppend(server)
+		go rf.sendAppend(server, chFinished)
 		rf.conds[server].L.Unlock()
-		// 等到超时即发送下一轮append请求
-		time.Sleep(time.Millisecond * 100)
+		// sendAppend执行完成或者执行超时，将发起下一次请求
+		select {
+		case <-chFinished:
+			break
+		case <-time.After(RpcTimeout): // 网络故障或者不再是Leader引起请求超时
+			break
+		}
 	}
 }
 
 func (rf *Raft) getAppendArgsWithoutLock(server int) AppendEntriesArgs {
-	// rf.mu.Lock()
-	// defer rf.mu.Unlock()
 	args := AppendEntriesArgs{}
 	args.Term = rf.CurrentTerm
 	args.LeaderId = rf.me
@@ -533,7 +541,7 @@ func (rf *Raft) needAppendWithoutLock(server int) bool {
 	return rf.nextIndex[server] < rf.firstIndexWithoutLock()+len(rf.LogEntries) && rf.state == Leader
 }
 
-func (rf *Raft) sendAppend(server int) {
+func (rf *Raft) sendAppend(server int, ch chan int) {
 	rf.mu.Lock()
 	// Note: 判断是否需要发送快照或者日志和获取rpc参数是一个整体，如果分别加锁，可能在获取参数的时候，并不满足条件。
 	// 发送快照
@@ -565,6 +573,7 @@ func (rf *Raft) sendAppend(server int) {
 	} else {
 		rf.mu.Unlock()
 	}
+	ch <- 0
 }
 
 //
@@ -645,7 +654,8 @@ func (rf *Raft) startElection(args *RequestVoteArgs) {
 							}
 						} else {
 							rf.updateCurrentTermWithoutLock(reply.Term)
-							DPrintf("{Peer=%d(term=%d)} refuse voting to %d(term=%d)", server, reply.Term, rf.me, rf.CurrentTerm)
+							DPrintf("{Peer=%d(term=%d)} refuse voting to %d(Term=%d, state=%d)",
+								server, reply.Term, rf.me, rf.CurrentTerm, rf.state)
 						}
 					}
 					rf.mu.Unlock()
@@ -699,8 +709,8 @@ func (rf *Raft) ticker() {
 func (rf *Raft) condWakeUpApplier() {
 	if rf.commitIndex > rf.lastApplied {
 		rf.applierCond.Signal()
-		DPrintf("{Peer=%d(Term=%d)} wake up applier with {commitIndex=%d, lastApplied=%d}",
-			rf.me, rf.CurrentTerm, rf.commitIndex, rf.lastApplied)
+		DPrintf("{Peer=%d(Term=%d, state=%d)} wake up applier with {commitIndex=%d, lastApplied=%d}",
+			rf.me, rf.CurrentTerm, rf.state, rf.commitIndex, rf.lastApplied)
 	}
 }
 
@@ -734,16 +744,25 @@ func (rf *Raft) applier() {
 		// 1. applier: lastApplied->log->applyCh
 		// 2. InstallSnapshot: lastApplied->snapshot->applyCh
 		rf.lastApplied = commitIndex
-		DPrintf("{Peer=%d(term=%d)} apply logs {index: (%d, %d]}",
-			rf.me, rf.CurrentTerm, rf.lastApplied-len(entries), rf.lastApplied)
+		DPrintf("{Peer=%d(Term=%d, state=%d)} apply logs {index: (%d, %d]}",
+			rf.me, rf.CurrentTerm, rf.state, rf.lastApplied-len(entries), rf.lastApplied)
 		rf.mu.Unlock()
 		for i, log := range entries {
-			msg := ApplyMsg{
-				CommandValid: true,
-				Command:      log.Command,
-				CommandIndex: i + lastApplied + 1,
+			rf.mu.Lock()
+			// 如果rf.lastApplied被InstallSnapshot修改，则这些日志不再需要被apply，因为快照中已经apply
+			if commitIndex == rf.lastApplied {
+				rf.mu.Unlock()
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      log.Command,
+					CommandIndex: i + lastApplied + 1,
+				}
+				rf.applyCh <- msg
+			} else {
+				DPrintf("{Peer=%d(Term=%d, state=%d)} lastApplied changed {old=%d, new=%d}",
+					rf.me, rf.CurrentTerm, rf.state, commitIndex, rf.lastApplied)
+				rf.mu.Unlock()
 			}
-			rf.applyCh <- msg
 		}
 		rf.applierCond.L.Unlock()
 	}

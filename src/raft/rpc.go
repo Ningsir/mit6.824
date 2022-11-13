@@ -34,8 +34,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.VotedFor = args.CandidateId
 			reply.VoteGranted = true
 			reply.Term = rf.CurrentTerm
-			DPrintf("Peer=%d(Term=%d, lastTerm=%d, lastLogIndex=%d) votes for %d(lastTerm=%d, lastLogIndex=%d)",
-				rf.me, rf.CurrentTerm, lastTerm, lastIndex, rf.VotedFor, args.LastLogTerm, args.LastLogIndex)
+			DPrintf("Peer=%d(Term=%d, state=%d, lastTerm=%d, lastLogIndex=%d) votes for %d(lastTerm=%d, lastLogIndex=%d)",
+				rf.me, rf.CurrentTerm, rf.state, lastTerm, lastIndex, rf.VotedFor, args.LastLogTerm, args.LastLogIndex)
 			return
 		}
 	}
@@ -118,8 +118,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				break
 			}
 		}
-		DPrintf("{Follower=%d(Term=%d)}, ConflictTerm=%d, MinIndex=%d} mismatch {Leader=%d(Term=%d), PrevLogIndex=%d, PrevLogTerm=%d}",
-			rf.me, rf.CurrentTerm, reply.ConflictTerm, reply.MinIndex, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
+		DPrintf("{Follower=%d(Term=%d, state=%d)}, ConflictTerm=%d, MinIndex=%d} mismatch {Leader=%d(Term=%d), PrevLogIndex=%d, PrevLogTerm=%d}",
+			rf.me, rf.CurrentTerm, rf.state, reply.ConflictTerm, reply.MinIndex, args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 		return
 	}
 
@@ -145,8 +145,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.LogEntries = append(rf.LogEntries, args.Entries[first:]...)
 		}
 		rf.persist()
-		DPrintf("{Follower=%d(Term=%d)} append entries with last entry=%+v",
-			rf.me, rf.CurrentTerm, rf.LogEntries[len(rf.LogEntries)-1])
+		DPrintf("{Follower=%d(Term=%d)} append entries with {last entry=%+v, index=%d",
+			rf.me, rf.CurrentTerm, rf.LogEntries[len(rf.LogEntries)-1], firstIndex+len(rf.LogEntries)-1)
 	}
 	// 根据参数leaderCommit更新commitIndex
 	if args.LeaderCommit > rf.commitIndex {
