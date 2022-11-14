@@ -1,13 +1,23 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync"
 
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	// 上一轮leader
+	lastLeader int
+	// <clientId, sequenceNum>唯一标识一条命令
+	clientId int64
+	// sequenceNum单调递增
+	sequenceNum int64
+	mu          sync.Mutex
 }
 
 func nrand() int64 {
@@ -21,6 +31,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.lastLeader = 0
+	ck.clientId = nrand()
+	ck.sequenceNum = 0
 	return ck
 }
 
@@ -39,6 +52,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	numServers := len(ck.servers)
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := &GetArgs{key, ck.sequenceNum, ck.clientId}
+	ck.sequenceNum += 1
+	reply := &GetReply{}
+	for i := ck.lastLeader; i < numServers; i = (i + 1) % numServers {
+		if ck.servers[i].Call("KVServer.Get", args, reply) {
+			switch reply.Err {
+			case OK:
+				ck.lastLeader = i
+				return reply.Value
+			case ErrNoKey:
+				ck.lastLeader = i
+				return ""
+			case ErrWrongLeader:
+				continue
+			case ErrTimeout:
+				continue
+			}
+		}
+	}
 	return ""
 }
 
@@ -54,6 +89,28 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	numServers := len(ck.servers)
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := &PutAppendArgs{key, value, op, ck.sequenceNum, ck.clientId}
+	ck.sequenceNum += 1
+	reply := &PutAppendReply{}
+	for i := ck.lastLeader; i < numServers; i = (i + 1) % numServers {
+		if ck.servers[i].Call("KVServer.PutAppend", args, reply) {
+			switch reply.Err {
+			case OK:
+				ck.lastLeader = i
+				return
+			case ErrNoKey:
+				ck.lastLeader = i
+				return
+			case ErrWrongLeader:
+				continue
+			case ErrTimeout:
+				continue
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
