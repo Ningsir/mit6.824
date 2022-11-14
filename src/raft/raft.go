@@ -730,39 +730,44 @@ func (rf *Raft) applier() {
 			rf.applierCond.Wait()
 		}
 		rf.mu.Lock()
-		entries := make([]Log, rf.commitIndex-rf.lastApplied)
-		firstIndex := rf.firstIndexWithoutLock()
-		if rf.lastApplied+1 < firstIndex {
-			log.Fatalf("Server %d: lastApplied %d < firstIndex %d", rf.me, rf.lastApplied, firstIndex)
-		}
-		copy(entries, rf.LogEntries[rf.lastApplied+1-firstIndex:rf.commitIndex+1-firstIndex])
-		lastApplied := rf.lastApplied
-		commitIndex := rf.commitIndex
-		// 先修改lastApplied再将日志传输到通道中，与InstallSnapshot保持一致
-		// 下面两项操作都是一个整体，如果在执行1修改lastApplied后, 再执行InstallSnapshot修改lastApplied,
-		// 然后再执行applyCh<-snapshot, 最后执行applyCh<-msg, 那么将导致apply out of order, 也就是将已经应用到状态机的日志再次应用到状态机。
-		// 1. applier: lastApplied->log->applyCh
-		// 2. InstallSnapshot: lastApplied->snapshot->applyCh
-		rf.lastApplied = commitIndex
-		DPrintf("{Peer=%d(Term=%d, state=%d)} apply logs {index: (%d, %d]}",
-			rf.me, rf.CurrentTerm, rf.state, rf.lastApplied-len(entries), rf.lastApplied)
-		rf.mu.Unlock()
-		for i, log := range entries {
-			rf.mu.Lock()
-			// 如果rf.lastApplied被InstallSnapshot修改，则这些日志不再需要被apply，因为快照中已经apply
-			if commitIndex == rf.lastApplied {
-				rf.mu.Unlock()
-				msg := ApplyMsg{
-					CommandValid: true,
-					Command:      log.Command,
-					CommandIndex: i + lastApplied + 1,
-				}
-				rf.applyCh <- msg
-			} else {
-				DPrintf("{Peer=%d(Term=%d, state=%d)} lastApplied changed {old=%d, new=%d}",
-					rf.me, rf.CurrentTerm, rf.state, commitIndex, rf.lastApplied)
-				rf.mu.Unlock()
+		// 双重检查：因为在执行完`needApply()`之后lastApplied可能又发生了变化。
+		if rf.commitIndex > rf.lastApplied {
+			entries := make([]Log, rf.commitIndex-rf.lastApplied)
+			firstIndex := rf.firstIndexWithoutLock()
+			if rf.lastApplied+1 < firstIndex {
+				log.Fatalf("Server %d: lastApplied %d < firstIndex %d", rf.me, rf.lastApplied, firstIndex)
 			}
+			copy(entries, rf.LogEntries[rf.lastApplied+1-firstIndex:rf.commitIndex+1-firstIndex])
+			lastApplied := rf.lastApplied
+			commitIndex := rf.commitIndex
+			// 先修改lastApplied再将日志传输到通道中，与InstallSnapshot保持一致
+			// 下面两项操作都是一个整体，如果在执行1修改lastApplied后, 再执行InstallSnapshot修改lastApplied,
+			// 然后再执行applyCh<-snapshot, 最后执行applyCh<-msg, 那么将导致apply out of order, 也就是将已经应用到状态机的日志再次应用到状态机。
+			// 1. applier: lastApplied->log->applyCh
+			// 2. InstallSnapshot: lastApplied->snapshot->applyCh
+			rf.lastApplied = commitIndex
+			DPrintf("{Peer=%d(Term=%d, state=%d)} apply logs {index: (%d, %d]}",
+				rf.me, rf.CurrentTerm, rf.state, rf.lastApplied-len(entries), rf.lastApplied)
+			rf.mu.Unlock()
+			for i, log := range entries {
+				rf.mu.Lock()
+				// 如果rf.lastApplied被InstallSnapshot修改，则这些日志不再需要被apply，因为快照中已经apply
+				if commitIndex == rf.lastApplied {
+					rf.mu.Unlock()
+					msg := ApplyMsg{
+						CommandValid: true,
+						Command:      log.Command,
+						CommandIndex: i + lastApplied + 1,
+					}
+					rf.applyCh <- msg
+				} else {
+					DPrintf("{Peer=%d(Term=%d, state=%d)} lastApplied changed {old=%d, new=%d}",
+						rf.me, rf.CurrentTerm, rf.state, commitIndex, rf.lastApplied)
+					rf.mu.Unlock()
+				}
+			}
+		} else {
+			rf.mu.Unlock()
 		}
 		rf.applierCond.L.Unlock()
 	}
