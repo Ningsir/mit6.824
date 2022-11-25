@@ -45,9 +45,10 @@ type CommonOp struct {
 type OpType string
 
 const (
-	GET    OpType = "GET"
-	APPEND OpType = "APPEND"
-	PUT    OpType = "PUT"
+	GET     OpType = "GET"
+	APPEND  OpType = "APPEND"
+	PUT     OpType = "PUT"
+	EMPTYOP OpType = "EMPTYOP"
 )
 
 type Op struct {
@@ -178,9 +179,35 @@ func (kv *ShardKV) pullConfig() {
 					command.Type = UpdateConfig
 					command.Command = config
 					kv.Execute(command)
+				} else {
+					DPrintf("shardkv pullconfig err: {Server=%d, group=%d} config=%+v, predicted config num=%d",
+						kv.me, kv.gid, config, num+1)
 				}
 			} else {
 				kv.mu.Unlock()
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) needInsertEmptyLog() bool {
+	lastTerm := kv.rf.LastTerm()
+	currentTerm, _ := kv.rf.GetState()
+	return currentTerm > lastTerm
+}
+func (kv *ShardKV) insertEmptyLog() {
+	for !kv.killed() {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			if kv.needInsertEmptyLog() {
+				DPrintf("shardkv executeEmptyCommand started: {Server=%d, group=%d} needApply=%v", kv.me, kv.gid, kv.rf.NeedApply())
+				op := Op{}
+				op.Type = EMPTYOP
+				commonOp := CommonOp{}
+				commonOp.Command = op
+				commonOp.Type = Operations
+				kv.Execute(commonOp)
+				DPrintf("shardkv executeEmptyCommand finished: {Server=%d, group=%d} needApply=%v", kv.me, kv.gid, kv.rf.NeedApply())
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -269,6 +296,9 @@ func (kv *ShardKV) pushShard() {
 								commonOp.Type = CreateShard
 								// 将Pushing状态的shard更新为Gcing
 								kv.Execute(commonOp)
+							} else {
+								DPrintf("shardkv pushshard err=%s: {Server=%d, group=%d} push with args=%+v",
+									reply.Err, kv.me, kv.gid, args)
 							}
 						}
 					}(servers, args)
@@ -279,7 +309,7 @@ func (kv *ShardKV) pushShard() {
 				kv.mu.Unlock()
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(35 * time.Millisecond)
 	}
 }
 
@@ -354,6 +384,9 @@ func (kv *ShardKV) deleteShard() {
 								commonOp.Command = args
 								commonOp.Type = DeleteShard
 								kv.Execute(commonOp)
+							} else {
+								DPrintf("shardkv deleteshard err=%s: {Server=%d, group=%d} delete with args=%+v",
+									reply.Err, kv.me, kv.gid, args)
 							}
 						}
 					}(servers, args)
@@ -478,6 +511,12 @@ func (kv *ShardKV) applyOpeartion(m raft.ApplyMsg) ApplyResult {
 	defer kv.mu.Unlock()
 	kv.lastApplied = m.CommandIndex
 	var result ApplyResult
+	if op.Type == EMPTYOP {
+		result.Err = OK
+		DPrintf("shardkv apply empty operations: {Server=%d, group=%d} apply {commandIndex=%d, command=%+v}",
+			kv.me, kv.gid, m.CommandIndex, m.Command)
+		return result
+	}
 	if !kv.inCurrentGroup(op.Key) {
 		result.Err = ErrWrongGroup
 	} else if !kv.isServing(op.Key) {
@@ -488,14 +527,16 @@ func (kv *ShardKV) applyOpeartion(m raft.ApplyMsg) ApplyResult {
 			kv.me, kv.gid, op, kv.clientLastApplied)
 		result.Err = OK
 	} else {
+		DPrintf("shardkv apply operations started: {Server=%d, group=%d} apply {commandIndex=%d, lastApplied=%d, command=%+v} {key=%s->value=%s}",
+			kv.me, kv.gid, m.CommandIndex, kv.lastApplied, m.Command, op.Key, kv.storage[key2shard(op.Key)].Data[op.Key])
 		// 执行对应命令, 并将结果写入commandResult
 		result = kv.executeCommandWithoutLock(op)
 		// read命令可以重复执行
 		if op.Type != GET {
 			kv.clientLastApplied[op.ClientId] = IdAndResponse{op.Id, string(result.Err)}
 		}
-		DPrintf("shardkv apply operations finished: {Server=%d, group=%d} apply {commandIndex=%d, lastApplied=%d, command=%+v}",
-			kv.me, kv.gid, m.CommandIndex, kv.lastApplied, m.Command)
+		DPrintf("shardkv apply operations finished: {Server=%d, group=%d} apply {commandIndex=%d, command=%+v} result={key=%s->value=%s}",
+			kv.me, kv.gid, m.CommandIndex, m.Command, op.Key, kv.storage[key2shard(op.Key)].Data[op.Key])
 	}
 	return result
 }
@@ -533,7 +574,7 @@ func (kv *ShardKV) applyShard(m raft.ApplyMsg) ApplyResult {
 		// 更新clientLastApplied
 		for client, data := range pushArgs.ClientLastApplied {
 			localData, ok := kv.clientLastApplied[client]
-			if ok && data.CommandId > localData.CommandId {
+			if (ok && data.CommandId > localData.CommandId) || !ok {
 				kv.clientLastApplied[client] = data
 			}
 		}
@@ -739,13 +780,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastApplied = 0
 	kv.clientLastApplied = make(map[int64]IdAndResponse)
 	kv.resultChan = make(map[int]chan ApplyResult)
-	kv.lastConfig = shardctrler.Config{}
 	kv.currentConfig = shardctrler.Config{}
+	kv.lastConfig = shardctrler.Config{}
 	kv.readSnapshot(persister.ReadSnapshot())
+	DPrintf("shardkv startServer: {Server=%d, group=%d} startServer with storage=%+v, clientLastApplied=%+v, currentConfig=%+v, lastConfig=%+v",
+		kv.me, kv.gid, kv.storage, kv.clientLastApplied, kv.currentConfig, kv.lastConfig)
+	DPrintf("shardkv startServer: {Server=%d, group=%d} startServer with logs=%+v", kv.me, kv.gid, kv.rf.LogEntries)
 	go kv.applier()
 	go kv.pullConfig()
 	go kv.pushShard()
 	go kv.deleteShard()
-
+	go kv.insertEmptyLog()
 	return kv
 }

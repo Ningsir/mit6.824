@@ -84,9 +84,17 @@ func (kv *ShardKV) PushShardService(args *PushShardArgs, reply *PushShardReply) 
 	}
 	kv.mu.Lock()
 	// 只能处理相同config Num的请求
-	if args.ConfigNum != kv.currentConfig.Num {
+	if args.ConfigNum > kv.currentConfig.Num {
 		reply.Err = ErrWrongConfigNum
-		DPrintf("shardkv PushShardService ErrWrongConfigNum: {Server=%d, group=%d} args configNum(%d) != currentNum(%d)",
+		DPrintf("shardkv PushShardService ErrWrongConfigNum: {Server=%d, group=%d} args configNum(%d) > currentNum(%d)",
+			kv.me, kv.gid, args.ConfigNum, kv.currentConfig.Num)
+		kv.mu.Unlock()
+		return
+	}
+	// 只能处理相同config Num的请求
+	if args.ConfigNum < kv.currentConfig.Num {
+		reply.Err = OK
+		DPrintf("shardkv PushShardService duplicate push: {Server=%d, group=%d} args configNum(%d) < currentNum(%d)",
 			kv.me, kv.gid, args.ConfigNum, kv.currentConfig.Num)
 		kv.mu.Unlock()
 		return
@@ -102,6 +110,7 @@ func (kv *ShardKV) PushShardService(args *PushShardArgs, reply *PushShardReply) 
 }
 
 // 服务端操作：删除状态为Gcing的shard
+// 注意：需要检测对应的shard的状态是否为Pushing状态，Pushing状态表明push操作还没有执行完毕。
 func (kv *ShardKV) DeleteShardService(args *DeleteShardArgs, reply *DeleteShardReply) {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
@@ -109,10 +118,40 @@ func (kv *ShardKV) DeleteShardService(args *DeleteShardArgs, reply *DeleteShardR
 	}
 	kv.mu.Lock()
 	// 只能处理相同config Num的请求
-	if args.ConfigNum != kv.currentConfig.Num {
+	if args.ConfigNum > kv.currentConfig.Num {
 		reply.Err = ErrWrongConfigNum
-		DPrintf("shardkv DeleteShardService ErrWrongConfigNum: {Server=%d, group=%d} args configNum(%d) != currentNum(%d)",
+		DPrintf("shardkv DeleteShardService ErrWrongConfigNum: {Server=%d, group=%d} args configNum(%d) > currentNum(%d)",
 			kv.me, kv.gid, args.ConfigNum, kv.currentConfig.Num)
+		kv.mu.Unlock()
+		return
+	}
+	// 当前config num更大表示该请求已经处理过
+	if args.ConfigNum < kv.currentConfig.Num {
+		reply.Err = OK
+		DPrintf("shardkv DeleteShardService duplicate delete: {Server=%d, group=%d} args configNum(%d) < currentNum(%d)",
+			kv.me, kv.gid, args.ConfigNum, kv.currentConfig.Num)
+		kv.mu.Unlock()
+		return
+	}
+	count := 0
+	// 检测Push操作是否已经完成，如果没有执行完，则直接返回
+	for _, shard := range args.ShardIds {
+		storage, ok := kv.storage[shard]
+		if ok && storage.Status == Pushing {
+			reply.Err = ErrPushNotDone
+			kv.mu.Unlock()
+			return
+		}
+		// 已经被delete
+		if !ok {
+			count += 1
+		}
+	}
+	// delete操作已经全部执行完
+	if count == len(args.ShardIds) {
+		DPrintf("shardkv DeleteShardService duplicate: {Server=%d, group=%d} args=%+v",
+			kv.me, kv.gid, args)
+		reply.Err = OK
 		kv.mu.Unlock()
 		return
 	}
