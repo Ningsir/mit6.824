@@ -720,6 +720,12 @@ func (rf *Raft) needApply() bool {
 	return rf.commitIndex > rf.lastApplied
 }
 
+func (rf *Raft) NeedApply() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex > rf.lastApplied
+}
+
 //
 // 应用到状态机，一次应用多条日志，不然效率太低，当日志太多的时候可能无法在给定时间内达成一致
 //
@@ -771,6 +777,16 @@ func (rf *Raft) applier() {
 		}
 		rf.applierCond.L.Unlock()
 	}
+}
+
+func (rf *Raft) LastTerm() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := len(rf.LogEntries) - 1
+	if index < 0 {
+		return rf.LastIncludedTerm
+	}
+	return rf.LogEntries[index].Term
 }
 
 //
