@@ -11,7 +11,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 const ExecuteTimeout = time.Millisecond * 200
 
@@ -102,36 +102,46 @@ func (sc *ShardCtrler) getResultChanWithoutLock(index int) (chan RpcResult, bool
 
 func (sc *ShardCtrler) start(op Op) RpcResult {
 	result := RpcResult{}
+	if _, isLeader := sc.rf.GetState(); !isLeader {
+		result.WrongLeader = true
+		result.Err = ErrWrongLeader
+		DPrintf("shardctrler op ErrWrongLeader: Server=%d op=%+v",
+			sc.me, op)
+		return result
+	}
 	sc.mu.Lock()
 	if op.Type != QUERY && sc.duplicateCommandWithoutLock(op) {
-		DPrintf("shardctrler: Server=%d process duplicate command=%+v, clientLastAplied: %v",
+		DPrintf("shardctrler duplicateCommand: Server=%d process duplicate command=%+v, clientLastAplied: %v",
 			sc.me, op, sc.clientLastApplied)
 		result.WrongLeader = false
 		result.Err = OK
 		sc.mu.Unlock()
 		return result
 	}
+	sc.mu.Unlock()
 	index, oldTerm, isLeader := sc.rf.Start(op)
 	if !isLeader {
 		result.WrongLeader = true
 		result.Err = ErrWrongLeader
-		sc.mu.Unlock()
+		DPrintf("shardctrler op ErrWrongLeader: Server=%d op=%+v",
+			sc.me, op)
 		return result
 	}
 	result.WrongLeader = false
-	DPrintf("shardctrler: Server=%d(raft term=%d) start with {op=%+v, command index=%d}",
+	DPrintf("shardctrler op start: Server=%d(raft term=%d) start with {op=%+v, command index=%d}",
 		sc.me, oldTerm, op, index)
+	sc.mu.Lock()
 	sc.resultChan[index] = make(chan RpcResult, 1)
 	ch := sc.resultChan[index]
 	sc.mu.Unlock()
 	select {
 	case data := <-ch:
-		DPrintf("shardctrler: Server=%d(raft Term=%d) start(index=%d) result=%+v",
+		DPrintf("shardctrler op finished: Server=%d(raft Term=%d) start(index=%d) result=%+v",
 			sc.me, oldTerm, index, data)
 		result.Err = data.Err
 		result.Config = data.Config
 	case <-time.After(ExecuteTimeout):
-		DPrintf("shardctrler: Server=%d(raft Term=%d) start(index=%d) Timeout",
+		DPrintf("shardctrler op ExecuteTimeout: Server=%d(raft Term=%d) start(index=%d) Timeout",
 			sc.me, oldTerm, index)
 		result.Err = ErrTimeout
 	}
